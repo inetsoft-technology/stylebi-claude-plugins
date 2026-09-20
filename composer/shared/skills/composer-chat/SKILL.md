@@ -47,7 +47,8 @@ the Composer's own editors, and re-runs on every refresh.
 | conditional colour by value | `set_highlight` | a script testing the value |
 | filter an assembly | `set_condition` | a script filtering the data |
 | move, resize, group, align | `edit` | positional script |
-| show or hide an assembly | `set_assembly_properties` | `assembly.visible = false` |
+| show or hide an assembly (fixed) | `set_assembly_properties` | `assembly.visible = false` |
+| a property or binding field driven by another control's live value | `set_assembly_properties`, `set_chart_shelf`/`set_table_fields`, `set_field_ranking`, `set_condition`/`set_highlight`, etc. with `"$(ComponentName)"` (single-valued control only — see caveat below) | a `viewsheetOnLoad` script (multi-valued control, e.g. CheckBox) |
 | sort or top-N | `set_field_sort`, `set_field_ranking` | a sorting script |
 
 **Script is the right answer** for behaviour no tool exposes: cross-assembly coordination on
@@ -105,6 +106,11 @@ does not enumerate it. Check this before starting the walk below:
    coordinates more than one assembly -> `viewsheetOnLoad`; scoped to one
    assembly's own rendering -> `assemblyMain`; triggered by a click ->
    `assemblyOnClick` (only on a click-capable assembly).
+   **Before a `viewsheetOnLoad` that only syncs one assembly's property or binding field to
+   another's current value** (a show/hide toggle is the classic case, but a chart axis field, a
+   ranking count, or a filter/highlight condition value qualify too), check the `$(ComponentName)`
+   binding in the Viewsheet caveats below — it needs no script, but only on a single-valued
+   control.
 
 **When two kinds both still look right, ask -- don't guess.** The classic
 case: "recalculate this value when the page loads" is genuinely ambiguous
@@ -127,6 +133,26 @@ evaluated") computed straight from this same table -- read it instead of
 re-deriving it when you're choosing among *existing* targets (e.g. deciding
 whether to edit `Chart1`'s existing main script or add a new `onClick`).
 
+## Choosing a dynamic-binding mechanism
+
+"Let one component's live value drive another" (a toggle shows/hides a chart, a threshold
+control recolors a cell, a dropdown swaps which measure a chart plots) can be built four
+different ways in StyleBI. Pick by **where the target value lives**, not by habit:
+
+| # | Mechanism | Syntax | Tools | Targets | Known limits |
+|---|---|---|---|---|---|
+| 1 | Component property/shelf field | `"$(ComponentName)"` plain string, **or `"=<script>"`** | `set_assembly_properties`, `set_chart_shelf`/`set_chart_single_shelf`/`set_table_fields`/`set_aesthetic_field` | Any scalar property (`visible`, `enabled`, `title`, …); a shelf's `column` | Both forms are StyleBI's `DynamicValue` convention (`inetsoft.uql.viewsheet.internal.VSUtil.isVariableValue`/`isScriptValue` — a leading `=` is evaluated as a script/expression, not a literal string, the same way `$(...)` is resolved as a component reference). `$(ComponentName)` only for CheckBox/ComboBox/RadioButton/Slider/Spinner/TextInput; CheckBox's array value is refused on a scalar target, allowed on a list-shaped one (a shelf's `fields`). **The `"=<script>"` form is confirmed at the source level, not yet verified live against a running server from this plugin** — see the Viewsheet caveats' `$(ComponentName)` entry below. |
+| 2 | Condition/Highlight value | `{type:"variable", name:"X"}` or `{type:"expression", expression:"parameter.X * 0.9"}` | `set_condition`, `set_highlight` | A filter/highlight comparison value | `parameter.<name>` reads the SAME store as `{type:"variable"}` — a form component's own name works directly, no worksheet variable needed. Gauge does not support highlight at all (refused). See `references/dashboardscript/Parameter.md`. |
+| 3 | Worksheet variable / Embedded Table input | `add_variable` + `set_variable_values`, or an input assembly's `table`/`columnValue`/`rowValue` Data Input binding | `add_variable`, `set_variable_values`, `set_assembly_properties` | A worksheet-level `$(name)` parameter feeding conditions/expressions across the whole worksheet | **Known BLOCKED**: once an assembly's value is bound this way, `set_input_value` on it permanently stops working (reports `ok:true`, does nothing) — see `docs/bug-reports/plugin-composer-viewsheet-filter-output-form.md`. Don't reach for this path to drive a live demo/test unless that's already understood. |
+| 4 | Script reads the value directly | `Comp1.value` / `parameter.Comp1` inside a script | `viewsheetOnLoad` (or another script kind — see above) | Anything a script can compute or coordinate across assemblies | The fallback for logic none of 1–3 can express (conditional branches, cross-assembly coordination) — see "Prefer the tool. Script is the fallback" above. |
+
+**1 and 2 are both capable of computing a value, not just substituting one.** Mechanism 1's
+`"=<script>"` form and mechanism 2's `expression` form (`parameter.Threshold * 0.9`) are both
+real expressions; `"$(ComponentName)"` and `{type:"variable"}` are both bare references, one per
+mechanism. Pick the mechanism by which TOOL owns the target — `set_assembly_properties`/a shelf
+field is mechanism 1, a Condition/Highlight is mechanism 2 — not by whether the value needs to be
+computed, since both can do that now.
+
 ## Undo steps are shared with the user
 
 Each `edit`, `set_format`, or binding/table write is exactly one undo checkpoint — matching one
@@ -148,6 +174,16 @@ crop coordinates weren't reliably consistent with the exporter's own canvas geom
 carries a `note` field when this fallback happened; read it before assuming the image shows only
 the assembly you asked for. A render can also 503 if a chart's graph hasn't finished computing yet
 — retry once after a beat before treating it as a real failure.
+
+## Push the live view back to the user, don't assume it follows automatically
+
+`get_viewsheet_image` is this session's OWN server-side render — a separate thing from what is
+currently on screen in the user's own open Composer browser tab, even though both look at the same
+runtime. A batch of edits does not necessarily redraw that tab by itself. Before telling the user an
+edit is done and they can look, call `edit(op: "refresh_viewsheet")` — confirmed empirically: the
+user's browser updated with no manual reload on their end after this call. The worksheet-domain
+equivalent is `refresh_data`, though that one hasn't been independently confirmed the same way —
+treat it as the likely counterpart, not as equally proven.
 
 ## Domain caveats
 
@@ -230,7 +266,16 @@ the assembly you asked for. A render can also 503 if a chart's graph hasn't fini
     most importantly, the `$<name>` cross-cell reference syntax and the `data[...]` source-data-query
     syntax used inside a formula cell's script — read this before writing any calc-table cross-cell
     formula (see the Binding section's calc-table paragraph below for the tool-level `name` field this
-    syntax depends on).
+    syntax depends on). Also covers `toList`'s `rounddate` grouping, `rowList()`, and why a date from
+    `data[...]`/`q[...]`/`$name` is a Java date — `.getFullYear()`/`.getMonth()` throw on it — read
+    before writing a calc-table formula that filters/buckets by year/month from a `runQuery()` result.
+  - `references/dashboardscript/Parameter.md` — the `parameter` scripting object: `parameter.<name>`
+    reads **either** a Data Worksheet variable **or a Form component's own live value by its
+    assembly name directly** (no `add_variable` needed for the latter — confirmed against the
+    official doc page and live against a connected viewsheet), plus the read-only session members
+    (`_USER_`/`_ROLES_`/`_GROUPS_`/etc.) and `parameter.parameterNames`/`parameter.length`. Read
+    this before writing a `{type: "expression", expression: "parameter.X * ..."}` condition/
+    highlight value — do not assume `parameter.X` requires a worksheet variable to exist first.
 
 ### Viewsheet
 
@@ -288,6 +333,43 @@ the assembly you asked for. A render can also 503 if a chart's graph hasn't fini
   spinner, text input, range slider, calendar, tab, line, oval, rectangle, submit. Image was
   genuinely uncovered until `PropertyPath` learned to read a bare Immutables accessor; it is
   covered now, so do not refuse an image-property request.
+- **`"$(ComponentName)"` binds live to another control's current value — for any property or
+  binding field that exposes Value Type "Variable" in the Composer's Properties dialog, not just
+  `visible`/`enabled`.** This is the same mechanism across tools: `set_assembly_properties`
+  fields generally, a chart/table binding field via `set_chart_shelf`/`set_table_fields`, the
+  ranking count via `set_field_ranking`, and a filter/highlight condition value via
+  `set_condition`/`set_highlight` all re-evaluate from the named control's value on every refresh,
+  no script needed. **Whether CheckBox belongs in that list depends on whether the TARGET is
+  itself scalar or a list — it is not a blanket "CheckBox is broken" rule:**
+  - **`set_assembly_properties`'s properties (`visible`, `enabled`, etc.) are genuine scalars.**
+    A CheckBox's value is always an array, even with one item selected, and that array never
+    propagates into a scalar property on refresh — the write saves clean and then silently never
+    updates, with no error. Confirmed live (2026-09-17): `Chart1.visible` bound to
+    `"$(SomeCheckBox)"` stayed on its last-written value forever regardless of the checkbox's
+    checked state, and this exact mistake was made twice across sessions before the check moved
+    into the tool itself — `set_assembly_properties` now refuses a CheckBox reference outright
+    with a field-named error (see `dynamicComponentRef.ts`'s `MULTI_VALUED_DYNAMIC_REFERENCE_TYPES`).
+    Use a `viewsheetOnLoad` script for a checkbox-driven property instead, e.g.
+    `Chart1.visible = CheckBox1.selectedObjects.length > 0;`.
+  - **A chart/table shelf's `fields` is already a list, and a CheckBox is the CORRECT control
+    when the goal is "let the user pick which columns appear on this shelf."** Confirmed live: a
+    y-shelf measure bound via `{column:'$(CheckBox1)', type:'measure'}` rendered as two separate
+    measures when CheckBox1 held two selected values, and live-collapsed to one measure when a
+    value was deselected — a real, working fan-out, not a silent failure. `set_chart_shelf`/
+    `set_table_fields`/`set_aesthetic_field` accept a CheckBox reference for exactly this reason;
+    don't "fix" this by rejecting it the way `set_assembly_properties` does. For a single-valued
+    swap (pick ONE of several columns), a single-valued control (RadioButton, ComboBox, Slider,
+    Spinner, TextInput) is still the right choice, since a CheckBox's own item order with 2+
+    selected isn't guaranteed to match the shelf's field order.
+  - `set_field_ranking`'s count and a `set_condition`/`set_highlight` value are not yet wired
+    through this same validator at all (as of 2026-09-17) — treat a CheckBox reference on either
+    as unverified rather than assuming it behaves like either case above.
+
+  The literal value a single-valued control's item(s) must carry depends on the target's own
+  type — `"true"`/`"false"` for a boolean like `visible`/`enabled` (label can say anything —
+  `$(...)` substitutes the value, not the label), a matching field/column name for a chart shelf
+  binding, an integer for `set_field_ranking`, and so on. Verify by toggling both ways and
+  re-rendering; a dead binding looks identical to a working one until flipped.
 - **A hyperlink hangs off a region, not the assembly as a whole** — a cell, an axis, a title, or
   the empty plot area. Omit the region for the assembly's own link; pass `row`/`col` (plus
   `colName` for a table) for a cell; pass `titleLink: true` for the title. Clearing is its own
@@ -458,6 +540,17 @@ the assembly you asked for. A render can also 503 if a chart's graph hasn't fini
   by one, so `modify_calc_layout`/`copy_calc_cells` return the updated layout; use that, not
   coordinates read before the call. Merging a single cell or splitting an unmerged one are refused
   (both are no-ops in the Composer that would otherwise report success).
+- **`rowGroup`/`colGroup` (aggregation scope) and `mergeRowGroup`/`mergeColGroup` (merge-span only,
+  never a computed value) are unrelated despite the near-identical names — never conclude the
+  latter should affect a value, that conclusion is always wrong.** See the "Full API" pointer below
+  (`references/dashboardscript/FreehandTable.md`'s `setRowGroup`/`setMergeRowGroup` sections) for
+  the complete rule — this bullet is a trip-wire, not the explanation.
+- **A subtotal row needs no group/expand cell of its own** — naming the detail row's group cell in
+  its summary cells' `rowGroup` (not `'(default)'`) is enough to make it repeat once per group. To
+  merge that group's label across the detail block and the subtotal row, use the STATIC
+  `modify_calc_layout(op:"mergeCells", ...)`, never `mergeRowGroup`/`mergeColGroup` — same silent
+  no-op shape as the bullet above. See `references/dashboardscript/FreehandTable.md`'s "Group-total
+  / subtotal rows" section.
 - A cell's optional script sits on top of this binding, and is a separate
   tool pair. get_calc_cell_script/set_calc_cell_script read/write the
   script a content: "formula" cell evaluates -- see "Choosing a script
@@ -528,6 +621,13 @@ tool for all of it.
   `attach_base_worksheet(path: <the saved path>)` → `save_viewsheet`. Stopping after
   `save_worksheet` leaves the viewsheet exactly as sourceless as before — when a viewsheet
   session is also held, `create_worksheet`'s own returned summary repeats this reminder.
+
+- **Before calling `create_worksheet` for a `runQuery()` data source, check whether an existing
+  worksheet already models the same underlying data at a different granularity — extend that one
+  instead of building a parallel one from scratch.** E.g. a grand-total worksheet getting a
+  follow-up "break it down by year" request: add the missing date column and re-group the SAME
+  worksheet, then derive the grand total by summing the finer-grained rows in script — don't keep a
+  second worksheet around just for the total.
 
 - **Read first, and after every structural change.** Call `read_worksheet_model` before proposing
   or applying any edit. New columns from `add_join`, `add_table`, `add_concatenation`, `add_mirror`,

@@ -322,7 +322,9 @@ StyleBI-specific surprises.
   remembering**: these functions operate only on objects that are genuine JavaScript `Date`
   instances (created via `new Date(...)`) — if the object isn't a JS Date, the corresponding Java
   method runs instead of the JavaScript one, which can silently change behavior when a "date" value
-  actually arrived as a `java.util.Date` from the data layer.
+  actually arrived as a `java.util.Date` from the data layer — see `../dashboardscript/FreehandTable.md`
+  for the Freehand Table case (a `data[...]`/`q[...]`/`$name` date is always a Java date) and the
+  `datePart`/`dateAdd`/`dateDiff` workaround.
 - **Array Object Functions** — standard JS `Array` methods: `concat`, `join`, `pop`, `push`,
   `reverse`, `shift`, `slice`, `sort`, `splice`, `unshift`.
 - **Math Object Functions** — standard `Math` constants (`E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`,
