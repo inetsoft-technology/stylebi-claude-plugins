@@ -9995,7 +9995,7 @@ var require_form_data = __commonJS({
     var http3 = __require("http");
     var https2 = __require("https");
     var parseUrl2 = __require("url").parse;
-    var fs6 = __require("fs");
+    var fs7 = __require("fs");
     var Stream = __require("stream").Stream;
     var crypto6 = __require("crypto");
     var mime = require_mime_types();
@@ -10065,7 +10065,7 @@ var require_form_data = __commonJS({
         if (value.end != void 0 && value.end != Infinity && value.start != void 0) {
           callback(null, value.end + 1 - (value.start ? value.start : 0));
         } else {
-          fs6.stat(value.path, function(err, stat) {
+          fs7.stat(value.path, function(err, stat) {
             if (err) {
               callback(err);
               return;
@@ -10787,7 +10787,7 @@ var require_has_flag = __commonJS({
 var require_supports_color = __commonJS({
   "../shared/core/node_modules/supports-color/index.js"(exports, module) {
     "use strict";
-    var os4 = __require("os");
+    var os5 = __require("os");
     var tty = __require("tty");
     var hasFlag = require_has_flag();
     var { env } = process;
@@ -10835,7 +10835,7 @@ var require_supports_color = __commonJS({
         return min;
       }
       if (process.platform === "win32") {
-        const osRelease = os4.release().split(".");
+        const osRelease = os5.release().split(".");
         if (Number(osRelease[0]) >= 10 && Number(osRelease[2]) >= 10586) {
           return Number(osRelease[2]) >= 14931 ? 3 : 2;
         }
@@ -17963,6 +17963,17 @@ function requireNoAtConditionTimeOfDay(condition, label) {
     }
   }
 }
+function requireNoOrgScopeParam(value, field, toolName) {
+  if (value === void 0 || value === null) {
+    return;
+  }
+  if (typeof value === "string" && value.trim() === "") {
+    return;
+  }
+  throw new Error(
+    `${field}: no longer accepted by ${toolName} \u2014 it always operates on the caller's current organization. Call switch_organization first to target a different organization, then call ${toolName} with no ${field} argument.`
+  );
+}
 function requireIntInRange(value, min, max, label) {
   if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
     throw new Error(`${label}: expected an integer between ${min} and ${max}; got ${JSON.stringify(value)}`);
@@ -18494,8 +18505,18 @@ function normalizeUnitType(raw, label) {
 var IDENTITY_SPEC_FIELDS = {
   user: /* @__PURE__ */ new Set(["name", "orgId", "password", "alias", "locale", "active", "emails", "groups", "theme"]),
   group: /* @__PURE__ */ new Set(["name", "orgId", "parentGroups", "memberUsers", "memberGroups", "theme"]),
-  role: /* @__PURE__ */ new Set(["name", "orgId", "description", "inheritedRoles", "assignedUsers", "assignedGroups", "theme"]),
-  organization: /* @__PURE__ */ new Set(["id", "orgName", "locale", "theme"])
+  role: /* @__PURE__ */ new Set([
+    "name",
+    "orgId",
+    "description",
+    "inheritedRoles",
+    "assignedUsers",
+    "assignedGroups",
+    "theme",
+    "defaultRole",
+    "sysAdmin"
+  ]),
+  organization: /* @__PURE__ */ new Set(["id", "orgName", "locale", "theme", "properties"])
 };
 var FIELD_OWNER = {
   password: "user",
@@ -18509,8 +18530,11 @@ var FIELD_OWNER = {
   inheritedRoles: "role",
   assignedUsers: "role",
   assignedGroups: "role",
+  defaultRole: "role",
+  sysAdmin: "role",
   id: "organization",
-  orgName: "organization"
+  orgName: "organization",
+  properties: "organization"
 };
 function validateIdentitySpecFields(unitType, spec, label) {
   const legal = IDENTITY_SPEC_FIELDS[unitType];
@@ -18561,16 +18585,67 @@ var IDENTITY_LIST_FIELDS = /* @__PURE__ */ new Set([
   "inheritedRoles"
 ]);
 function describeIdentityUpdateFieldClear(key) {
-  if (key === "active") {
+  if (key === "active" || key === "defaultRole" || key === "sysAdmin") {
     return "omit it to leave unchanged, or send true/false explicitly";
   }
   if (key === "name") {
     return "omit it to leave unchanged (an empty name is not allowed either)";
   }
+  if (key === "properties") {
+    return "omit it to leave unchanged, or send [] / {} to clear every property EXCEPT the 4 named quota keys (max.row.count/max.col.count/max.cell.size/max.user.count), which are preserved unless explicitly named";
+  }
   if (IDENTITY_LIST_FIELDS.has(key)) {
     return "omit it to leave unchanged, or send [] to clear it";
   }
   return 'omit it to leave unchanged, or send "" to clear it';
+}
+function coerceIdentityPropertyValue(raw, label) {
+  if (typeof raw === "string") {
+    return raw;
+  }
+  if (typeof raw === "number" || typeof raw === "boolean") {
+    return String(raw);
+  }
+  throw new Error(
+    `${label}: expected a string, number, or boolean (organization properties cannot be cleared with null here -- omit the property from the list instead); got ${raw === null ? "null" : Array.isArray(raw) ? "array" : typeof raw}`
+  );
+}
+function readIdentityPropertyEntry(raw, label) {
+  if (!isPlainObject2(raw)) {
+    throw new Error(`${label}: expected an object like { name, value }, got ${typeof raw}`);
+  }
+  const rawName = raw.name ?? raw.property ?? raw.key;
+  if (typeof rawName !== "string" || rawName.trim() === "") {
+    throw new Error(
+      `${label}.name: required (a non-blank property name; \`property\`/\`key\` accepted as aliases)`
+    );
+  }
+  if (!("value" in raw)) {
+    throw new Error(`${label}.value: required (a string, number, or boolean)`);
+  }
+  return { name: rawName.trim(), value: coerceIdentityPropertyValue(raw.value, `${label}.value`) };
+}
+function normalizeIdentityProperties(raw, label) {
+  let entries;
+  if (Array.isArray(raw)) {
+    entries = raw;
+  } else if (isPlainObject2(raw)) {
+    if (Object.keys(raw).length === 0 || looksLikeValueMap(raw)) {
+      entries = Object.entries(raw).map(([name, value]) => ({ name, value }));
+    } else {
+      throw new Error(
+        `${label}: expected an array of { name, value }, or a name->value map; the object given is neither`
+      );
+    }
+  } else {
+    throw new Error(`${label}: expected an array of { name, value }, or a name->value map`);
+  }
+  const parsed = entries.map((entry, i) => readIdentityPropertyEntry(entry, `${label}[${i}]`));
+  const byName = /* @__PURE__ */ new Map();
+  for (const property of parsed) {
+    byName.set(property.name, property);
+  }
+  return [...byName.values()];
 }
 function readIdentityChange(raw, index) {
   const label = `changes[${index}]`;
@@ -18610,41 +18685,45 @@ function readIdentityChange(raw, index) {
         `${label}.spec: at least one field is required for verb="update" (nothing to change) \u2014 shaped for unitType="${unitType}"`
       );
     }
-    const spec = { ...raw.spec };
+    const spec2 = { ...raw.spec };
     const specOrgId = unitType === "organization" ? id : parseNameOrgRef(id).orgId;
     if (unitType === "user") {
-      if (spec.groups !== void 0 && spec.groups !== null) {
-        spec.groups = normalizeUserGroupRefs(spec.groups, specOrgId, `${label}.spec.groups`);
+      if (spec2.groups !== void 0 && spec2.groups !== null) {
+        spec2.groups = normalizeUserGroupRefs(spec2.groups, specOrgId, `${label}.spec.groups`);
       }
-      if (spec.roles !== void 0 && spec.roles !== null) {
-        spec.roles = normalizeUserRoleRefs(spec.roles, specOrgId, `${label}.spec.roles`);
+      if (spec2.roles !== void 0 && spec2.roles !== null) {
+        spec2.roles = normalizeUserRoleRefs(spec2.roles, specOrgId, `${label}.spec.roles`);
       }
     } else if (unitType === "group") {
-      if (spec.memberUsers !== void 0 && spec.memberUsers !== null) {
-        spec.memberUsers = normalizeGroupMemberRefs(spec.memberUsers, specOrgId, `${label}.spec.memberUsers`);
+      if (spec2.memberUsers !== void 0 && spec2.memberUsers !== null) {
+        spec2.memberUsers = normalizeGroupMemberRefs(spec2.memberUsers, specOrgId, `${label}.spec.memberUsers`);
       }
-      if (spec.memberGroups !== void 0 && spec.memberGroups !== null) {
-        spec.memberGroups = normalizeGroupMemberRefs(spec.memberGroups, specOrgId, `${label}.spec.memberGroups`);
+      if (spec2.memberGroups !== void 0 && spec2.memberGroups !== null) {
+        spec2.memberGroups = normalizeGroupMemberRefs(spec2.memberGroups, specOrgId, `${label}.spec.memberGroups`);
       }
-      if (spec.roles !== void 0 && spec.roles !== null) {
-        spec.roles = normalizeGroupRoleRefs(spec.roles, specOrgId, `${label}.spec.roles`);
+      if (spec2.roles !== void 0 && spec2.roles !== null) {
+        spec2.roles = normalizeGroupRoleRefs(spec2.roles, specOrgId, `${label}.spec.roles`);
       }
-      if (spec.parentGroups !== void 0 && spec.parentGroups !== null) {
-        spec.parentGroups = normalizeGroupMemberRefs(spec.parentGroups, specOrgId, `${label}.spec.parentGroups`);
+      if (spec2.parentGroups !== void 0 && spec2.parentGroups !== null) {
+        spec2.parentGroups = normalizeGroupMemberRefs(spec2.parentGroups, specOrgId, `${label}.spec.parentGroups`);
       }
     } else if (unitType === "role") {
-      if (spec.assignedUsers !== void 0 && spec.assignedUsers !== null) {
-        spec.assignedUsers = normalizeRoleAssignedRefs(spec.assignedUsers, specOrgId, `${label}.spec.assignedUsers`);
+      if (spec2.assignedUsers !== void 0 && spec2.assignedUsers !== null) {
+        spec2.assignedUsers = normalizeRoleAssignedRefs(spec2.assignedUsers, specOrgId, `${label}.spec.assignedUsers`);
       }
-      if (spec.assignedGroups !== void 0 && spec.assignedGroups !== null) {
-        spec.assignedGroups = normalizeRoleAssignedRefs(spec.assignedGroups, specOrgId, `${label}.spec.assignedGroups`);
+      if (spec2.assignedGroups !== void 0 && spec2.assignedGroups !== null) {
+        spec2.assignedGroups = normalizeRoleAssignedRefs(spec2.assignedGroups, specOrgId, `${label}.spec.assignedGroups`);
       }
-      if (spec.inheritedRoles !== void 0 && spec.inheritedRoles !== null) {
-        spec.inheritedRoles = normalizeRoleAssignedRefs(spec.inheritedRoles, specOrgId, `${label}.spec.inheritedRoles`);
+      if (spec2.inheritedRoles !== void 0 && spec2.inheritedRoles !== null) {
+        spec2.inheritedRoles = normalizeRoleAssignedRefs(spec2.inheritedRoles, specOrgId, `${label}.spec.inheritedRoles`);
+      }
+    } else if (unitType === "organization") {
+      if (spec2.properties !== void 0 && spec2.properties !== null) {
+        spec2.properties = normalizeIdentityProperties(spec2.properties, `${label}.spec.properties`);
       }
     }
-    for (const key of Object.keys(spec)) {
-      const value = spec[key];
+    for (const key of Object.keys(spec2)) {
+      const value = spec2[key];
       if (key === "name" && typeof value === "string" && value.trim() === "") {
         throw new Error(
           `${label}.spec.name: an empty name is not allowed for verb="update" (omit "name" to leave it unchanged)`
@@ -18656,7 +18735,7 @@ function readIdentityChange(raw, index) {
         );
       }
     }
-    return { verb, unitType, id, spec };
+    return { verb, unitType, id, spec: spec2 };
   }
   if (verb === "delete") {
     if ("spec" in raw && raw.spec !== void 0 && raw.spec !== null) {
@@ -18677,48 +18756,52 @@ function readIdentityChange(raw, index) {
   }
   validateIdentitySpecFields(unitType, raw.spec, label);
   if (unitType === "user") {
-    const spec = { ...raw.spec };
-    const specOrgId = typeof spec.orgId === "string" && spec.orgId.trim() !== "" ? spec.orgId.trim() : void 0;
-    if (spec.groups !== void 0 && spec.groups !== null) {
-      spec.groups = normalizeUserGroupRefs(spec.groups, specOrgId, `${label}.spec.groups`);
+    const spec2 = { ...raw.spec };
+    const specOrgId = typeof spec2.orgId === "string" && spec2.orgId.trim() !== "" ? spec2.orgId.trim() : void 0;
+    if (spec2.groups !== void 0 && spec2.groups !== null) {
+      spec2.groups = normalizeUserGroupRefs(spec2.groups, specOrgId, `${label}.spec.groups`);
     }
-    if (spec.roles !== void 0 && spec.roles !== null) {
-      spec.roles = normalizeUserRoleRefs(spec.roles, specOrgId, `${label}.spec.roles`);
+    if (spec2.roles !== void 0 && spec2.roles !== null) {
+      spec2.roles = normalizeUserRoleRefs(spec2.roles, specOrgId, `${label}.spec.roles`);
     }
-    return { verb, unitType, spec };
+    return { verb, unitType, spec: spec2 };
   }
   if (unitType === "group") {
-    const spec = { ...raw.spec };
-    const specOrgId = typeof spec.orgId === "string" && spec.orgId.trim() !== "" ? spec.orgId.trim() : void 0;
-    if (spec.memberUsers !== void 0 && spec.memberUsers !== null) {
-      spec.memberUsers = normalizeGroupMemberRefs(spec.memberUsers, specOrgId, `${label}.spec.memberUsers`);
+    const spec2 = { ...raw.spec };
+    const specOrgId = typeof spec2.orgId === "string" && spec2.orgId.trim() !== "" ? spec2.orgId.trim() : void 0;
+    if (spec2.memberUsers !== void 0 && spec2.memberUsers !== null) {
+      spec2.memberUsers = normalizeGroupMemberRefs(spec2.memberUsers, specOrgId, `${label}.spec.memberUsers`);
     }
-    if (spec.memberGroups !== void 0 && spec.memberGroups !== null) {
-      spec.memberGroups = normalizeGroupMemberRefs(spec.memberGroups, specOrgId, `${label}.spec.memberGroups`);
+    if (spec2.memberGroups !== void 0 && spec2.memberGroups !== null) {
+      spec2.memberGroups = normalizeGroupMemberRefs(spec2.memberGroups, specOrgId, `${label}.spec.memberGroups`);
     }
-    if (spec.roles !== void 0 && spec.roles !== null) {
-      spec.roles = normalizeGroupRoleRefs(spec.roles, specOrgId, `${label}.spec.roles`);
+    if (spec2.roles !== void 0 && spec2.roles !== null) {
+      spec2.roles = normalizeGroupRoleRefs(spec2.roles, specOrgId, `${label}.spec.roles`);
     }
-    if (spec.parentGroups !== void 0 && spec.parentGroups !== null) {
-      spec.parentGroups = normalizeGroupMemberRefs(spec.parentGroups, specOrgId, `${label}.spec.parentGroups`);
+    if (spec2.parentGroups !== void 0 && spec2.parentGroups !== null) {
+      spec2.parentGroups = normalizeGroupMemberRefs(spec2.parentGroups, specOrgId, `${label}.spec.parentGroups`);
     }
-    return { verb, unitType, spec };
+    return { verb, unitType, spec: spec2 };
   }
   if (unitType === "role") {
-    const spec = { ...raw.spec };
-    const specOrgId = typeof spec.orgId === "string" && spec.orgId.trim() !== "" ? spec.orgId.trim() : void 0;
-    if (spec.assignedUsers !== void 0 && spec.assignedUsers !== null) {
-      spec.assignedUsers = normalizeRoleAssignedRefs(spec.assignedUsers, specOrgId, `${label}.spec.assignedUsers`);
+    const spec2 = { ...raw.spec };
+    const specOrgId = typeof spec2.orgId === "string" && spec2.orgId.trim() !== "" ? spec2.orgId.trim() : void 0;
+    if (spec2.assignedUsers !== void 0 && spec2.assignedUsers !== null) {
+      spec2.assignedUsers = normalizeRoleAssignedRefs(spec2.assignedUsers, specOrgId, `${label}.spec.assignedUsers`);
     }
-    if (spec.assignedGroups !== void 0 && spec.assignedGroups !== null) {
-      spec.assignedGroups = normalizeRoleAssignedRefs(spec.assignedGroups, specOrgId, `${label}.spec.assignedGroups`);
+    if (spec2.assignedGroups !== void 0 && spec2.assignedGroups !== null) {
+      spec2.assignedGroups = normalizeRoleAssignedRefs(spec2.assignedGroups, specOrgId, `${label}.spec.assignedGroups`);
     }
-    if (spec.inheritedRoles !== void 0 && spec.inheritedRoles !== null) {
-      spec.inheritedRoles = normalizeRoleAssignedRefs(spec.inheritedRoles, specOrgId, `${label}.spec.inheritedRoles`);
+    if (spec2.inheritedRoles !== void 0 && spec2.inheritedRoles !== null) {
+      spec2.inheritedRoles = normalizeRoleAssignedRefs(spec2.inheritedRoles, specOrgId, `${label}.spec.inheritedRoles`);
     }
-    return { verb, unitType, spec };
+    return { verb, unitType, spec: spec2 };
   }
-  return { verb, unitType, spec: raw.spec };
+  const spec = { ...raw.spec };
+  if (spec.properties !== void 0 && spec.properties !== null) {
+    spec.properties = normalizeIdentityProperties(spec.properties, `${label}.spec.properties`);
+  }
+  return { verb, unitType, spec };
 }
 function normalizeIdentityChanges(input) {
   let entries;
@@ -18749,17 +18832,12 @@ function normalizeProviderType(raw, chain, label) {
   const v = typeof raw === "string" ? raw.trim().toUpperCase() : raw;
   if (v !== "FILE" && v !== "LDAP" && v !== "DATABASE" && v !== "CUSTOM") {
     throw new Error(
-      `${label}.providerType: required, must be "FILE" or "LDAP" (chain="authorization" accepts only "FILE"); got ${JSON.stringify(raw)}`
-    );
-  }
-  if (v === "DATABASE") {
-    throw new Error(
-      `${label}.providerType: "DATABASE" is not supported in this area's first cut \u2014 the underlying service does not itself enforce the license gate the Enterprise Manager UI uses to hide this option on a non-enterprise license, and this area's own service self-imposes the restriction instead of inheriting that gap. Use "FILE" or "LDAP" instead.`
+      `${label}.providerType: required, must be "FILE", "LDAP", or "DATABASE" (chain="authorization" accepts only "FILE"); got ${JSON.stringify(raw)}`
     );
   }
   if (v === "CUSTOM") {
     throw new Error(
-      `${label}.providerType: "CUSTOM" is not supported in this area's first cut \u2014 it loads a caller-named class from the server's classpath and feeds it a schema-free configuration blob, an unbounded secrets/injection surface this area does not attempt to reason about safely. Use "FILE" or "LDAP" instead.`
+      `${label}.providerType: "CUSTOM" is not supported in this area's first cut \u2014 it loads a caller-named class from the server's classpath and feeds it a schema-free configuration blob, an unbounded secrets/injection surface this area does not attempt to reason about safely. Use "FILE", "LDAP", or "DATABASE" instead.`
     );
   }
   if (chain === "authorization" && v !== "FILE") {
@@ -18845,6 +18923,114 @@ function validateLdapCredentialMode(spec, label) {
     }
   }
 }
+var LDAP_BASE_FIELDS = ["userBase", "groupBase", "roleBase"];
+function stripRootDnSuffix(unit, rootDN) {
+  const trimmed = unit.trim();
+  if (trimmed.toLowerCase() === rootDN.toLowerCase()) {
+    return "";
+  }
+  const suffix = "," + rootDN;
+  if (trimmed.toLowerCase().endsWith(suffix.toLowerCase())) {
+    return trimmed.slice(0, trimmed.length - suffix.length);
+  }
+  return trimmed;
+}
+function normalizeGenericLdapBases(spec) {
+  const ldapServer = typeof spec.ldapServer === "string" ? spec.ldapServer.toUpperCase() : "";
+  const rootDN = typeof spec.rootDN === "string" ? spec.rootDN.trim() : "";
+  if (ldapServer !== "GENERIC" || rootDN === "") {
+    return spec;
+  }
+  const normalized = { ...spec };
+  for (const field of LDAP_BASE_FIELDS) {
+    const value = normalized[field];
+    if (typeof value !== "string" || value.trim() === "") {
+      continue;
+    }
+    normalized[field] = value.split(";").map((unit) => stripRootDnSuffix(unit, rootDN)).join(";");
+  }
+  return normalized;
+}
+var DATABASE_SPEC_FIELDS = /* @__PURE__ */ new Set([
+  "driver",
+  "url",
+  "requiresLogin",
+  "useCredential",
+  "secretId",
+  "user",
+  "password",
+  "hashAlgorithm",
+  "userQuery",
+  "userListQuery",
+  "groupListQuery",
+  "groupUsersQuery",
+  "roleListQuery",
+  "userRolesQuery",
+  "userRoleListQuery",
+  "organizationListQuery",
+  "organizationNameQuery",
+  "organizationMembersQuery",
+  "organizationRolesQuery",
+  "userEmailsQuery",
+  "appendSalt",
+  "sysAdminRoles",
+  "orgAdminRoles"
+]);
+function validateDatabaseSpecFields(spec, label) {
+  for (const key of Object.keys(spec)) {
+    if (spec[key] === void 0 || spec[key] === null) {
+      continue;
+    }
+    if (!DATABASE_SPEC_FIELDS.has(key)) {
+      throw new Error(`${label}.databaseSpec.${key}: not a recognized DATABASE provider field`);
+    }
+  }
+}
+function validateDatabaseCredentialMode(spec, label) {
+  if (spec.requiresLogin === false) {
+    return;
+  }
+  const useCredential = spec.useCredential === true;
+  const hasSecretId = typeof spec.secretId === "string" && spec.secretId.trim() !== "";
+  const hasUser = typeof spec.user === "string" && spec.user.trim() !== "";
+  const hasPassword = typeof spec.password === "string" && spec.password.trim() !== "";
+  if (useCredential) {
+    if (!hasSecretId) {
+      throw new Error(
+        `${label}.databaseSpec.secretId: required when useCredential=true (the credential is resolved by reference, not supplied inline)`
+      );
+    }
+    if (hasUser || hasPassword) {
+      throw new Error(
+        `${label}.databaseSpec.user/password: not used when useCredential=true \u2014 the credential comes from secretId instead; remove user/password or set useCredential=false`
+      );
+    }
+  } else {
+    if (!hasUser || !hasPassword) {
+      throw new Error(
+        `${label}.databaseSpec.user/password: both required when useCredential=false (the default) \u2014 pass both, or set useCredential=true and provide secretId instead`
+      );
+    }
+    if (hasSecretId) {
+      throw new Error(
+        `${label}.databaseSpec.secretId: not used when useCredential=false (or omitted) \u2014 remove it or set useCredential=true`
+      );
+    }
+  }
+}
+function validateDatabasePartialCredentialMode(spec, label) {
+  if (spec.requiresLogin === false) {
+    return;
+  }
+  const hasSecretId = typeof spec.secretId === "string" && spec.secretId.trim() !== "";
+  const hasUser = typeof spec.user === "string" && spec.user.trim() !== "";
+  const hasPassword = typeof spec.password === "string" && spec.password.trim() !== "";
+  if (hasSecretId && (hasUser || hasPassword)) {
+    throw new Error(
+      `${label}.databaseSpec.secretId/user/password: secretId (credential-by-reference) cannot be sent together with user/password (credential-by-value) in the same update \u2014 these belong to opposite useCredential modes; send only the fields for the mode you intend to (re)set`
+    );
+  }
+}
 function normalizeProviderVerb(raw, label) {
   const v = typeof raw === "string" ? raw.trim().toLowerCase() : raw;
   if (v === "create" || v === "add") {
@@ -18886,6 +19072,11 @@ function readProviderChange(raw, index) {
     if ("spec" in raw && raw.spec !== void 0 && raw.spec !== null) {
       throw new Error(`${label}.spec: not used for verb=delete; remove it or use verb=create`);
     }
+    if ("databaseSpec" in raw && raw.databaseSpec !== void 0 && raw.databaseSpec !== null) {
+      throw new Error(
+        `${label}.databaseSpec: not used for verb=delete; remove it or use verb=create`
+      );
+    }
     return { verb, chain, name };
   }
   if (verb === "duplicate") {
@@ -18897,6 +19088,11 @@ function readProviderChange(raw, index) {
     if ("spec" in raw && raw.spec !== void 0 && raw.spec !== null) {
       throw new Error(
         `${label}.spec: not used for verb=duplicate; a duplicate keeps the source provider's own configuration \u2014 use newName to control only its name`
+      );
+    }
+    if ("databaseSpec" in raw && raw.databaseSpec !== void 0 && raw.databaseSpec !== null) {
+      throw new Error(
+        `${label}.databaseSpec: not used for verb=duplicate; a duplicate keeps the source provider's own configuration \u2014 use newName to control only its name`
       );
     }
     const newNameRaw = raw.newName;
@@ -18919,10 +19115,31 @@ function readProviderChange(raw, index) {
         `${label}.newName: not used for verb=update; renaming is not supported through this verb`
       );
     }
-    if (!isPlainObject2(raw.spec)) {
+    const hasSpec = isPlainObject2(raw.spec);
+    const hasDatabaseSpec = isPlainObject2(raw.databaseSpec);
+    if (hasSpec && hasDatabaseSpec) {
       throw new Error(
-        `${label}.spec: required for verb=update (a partial-field object with at least one LDAP field to change; NOT a full provider passthrough \u2014 any field you omit is preserved unchanged from the current provider)`
+        `${label}.spec/databaseSpec: only one may be given for verb=update \u2014 spec if the target provider is LDAP, databaseSpec if it is DATABASE (call get_auth_provider/get_authz_provider first to confirm which)`
       );
+    }
+    if (!hasSpec && !hasDatabaseSpec) {
+      throw new Error(
+        `${label}.spec/databaseSpec: one is required for verb=update (a partial-field object with at least one field to change; NOT a full provider passthrough \u2014 any field you omit is preserved unchanged from the current provider) \u2014 spec for an LDAP provider, databaseSpec for a DATABASE provider`
+      );
+    }
+    if (isPlainObject2(raw.databaseSpec)) {
+      const updateSpec2 = raw.databaseSpec;
+      const specKeys2 = Object.keys(updateSpec2).filter(
+        (k) => updateSpec2[k] !== void 0 && updateSpec2[k] !== null
+      );
+      if (specKeys2.length === 0) {
+        throw new Error(
+          `${label}.databaseSpec: must not be empty \u2014 specify at least one field to change`
+        );
+      }
+      validateDatabaseSpecFields(updateSpec2, label);
+      validateDatabasePartialCredentialMode(updateSpec2, label);
+      return { verb, chain, name, databaseSpec: updateSpec2 };
     }
     const updateSpec = raw.spec;
     const specKeys = Object.keys(updateSpec).filter(
@@ -18933,7 +19150,7 @@ function readProviderChange(raw, index) {
     }
     validateLdapSpecFields(updateSpec, label);
     validateLdapPartialCredentialMode(updateSpec, label);
-    return { verb, chain, name, spec: updateSpec };
+    return { verb, chain, name, spec: normalizeGenericLdapBases(updateSpec) };
   }
   const providerType = normalizeProviderType(raw.providerType, chain, label);
   if (providerType === "FILE") {
@@ -18943,7 +19160,30 @@ function readProviderChange(raw, index) {
         `${label}.spec: not used for providerType="FILE" (a FILE provider has no configuration beyond its name)`
       );
     }
+    if ("databaseSpec" in raw && raw.databaseSpec !== void 0 && raw.databaseSpec !== null) {
+      throw new Error(
+        `${label}.databaseSpec: not used for providerType="FILE" (a FILE provider has no configuration beyond its name)`
+      );
+    }
     return { verb, chain, name, providerType };
+  }
+  if (providerType === "DATABASE") {
+    if ("spec" in raw && raw.spec !== void 0 && raw.spec !== null) {
+      throw new Error(
+        `${label}.spec: not used for providerType="DATABASE"; use databaseSpec instead`
+      );
+    }
+    if (!isPlainObject2(raw.databaseSpec)) {
+      throw new Error(
+        `${label}.databaseSpec: required for providerType="DATABASE" (an object with driver/url/hashAlgorithm and related fields)`
+      );
+    }
+    validateDatabaseSpecFields(raw.databaseSpec, label);
+    validateDatabaseCredentialMode(raw.databaseSpec, label);
+    return { verb, chain, name, providerType, databaseSpec: raw.databaseSpec };
+  }
+  if ("databaseSpec" in raw && raw.databaseSpec !== void 0 && raw.databaseSpec !== null) {
+    throw new Error(`${label}.databaseSpec: not used for providerType="LDAP"; use spec instead`);
   }
   if (!isPlainObject2(raw.spec)) {
     throw new Error(
@@ -18952,7 +19192,7 @@ function readProviderChange(raw, index) {
   }
   validateLdapSpecFields(raw.spec, label);
   validateLdapCredentialMode(raw.spec, label);
-  return { verb, chain, name, providerType, spec: raw.spec };
+  return { verb, chain, name, providerType, spec: normalizeGenericLdapBases(raw.spec) };
 }
 function normalizeProviderChanges(input) {
   let entries;
@@ -18965,7 +19205,7 @@ function normalizeProviderChanges(input) {
     entries = [input];
   } else {
     throw new Error(
-      'changes: required \u2014 an array of { verb, chain, name, providerType?, spec?, newName? } (verb is "create", "delete", "duplicate", or "update"; chain is "authentication" or "authorization")'
+      'changes: required \u2014 an array of { verb, chain, name, providerType?, spec?, databaseSpec?, newName? } (verb is "create", "delete", "duplicate", or "update"; chain is "authentication" or "authorization"; spec is LDAP configuration, databaseSpec is DATABASE configuration \u2014 never both on the same entry)'
     );
   }
   return entries.map(readProviderChange);
@@ -19290,6 +19530,43 @@ function normalizeClusterChanges(input) {
     verbIndexByServer.set(change.server, verbsForServer);
   });
   return normalized;
+}
+function normalizeSchedulerStatusVerb(raw, label) {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : raw;
+  if (v === "start" || v === "stop" || v === "restart") {
+    return v;
+  }
+  throw new Error(
+    `${label}.verb: must be "start", "stop", or "restart" (no aliases); got ${JSON.stringify(raw)}`
+  );
+}
+function readSchedulerStatusChange(raw, index) {
+  const label = `changes[${index}]`;
+  if (!isPlainObject2(raw)) {
+    throw new Error(`${label}: expected an object like { verb }, got ${typeof raw}`);
+  }
+  return { verb: normalizeSchedulerStatusVerb(raw.verb, label) };
+}
+function normalizeSchedulerStatusChanges(input) {
+  let entries;
+  if (Array.isArray(input)) {
+    if (input.length === 0) {
+      throw new Error("changes: must not be empty \u2014 pass exactly one { verb }");
+    }
+    entries = input;
+  } else if (isPlainObject2(input)) {
+    entries = [input];
+  } else {
+    throw new Error(
+      'changes: required \u2014 an array with exactly one { verb } entry (verb is "start", "stop", or "restart")'
+    );
+  }
+  if (entries.length > 1) {
+    throw new Error(
+      'changes: this area addresses exactly one target \u2014 "the scheduler" \u2014 so changes must contain exactly one entry; issue two separate preview/apply round trips for more than one action (e.g. stop, then later start)'
+    );
+  }
+  return entries.map(readSchedulerStatusChange);
 }
 function normalizeViewsheetUnitType(raw, label) {
   const v = typeof raw === "string" ? raw.trim().toLowerCase() : raw;
@@ -19834,13 +20111,16 @@ function normalizeLicenseVerb(raw, label) {
   if (v === "remove" || v === "uninstall" || v === "delete") {
     return "remove";
   }
-  if (v === "update" || v === "replace" || v === "set") {
+  if (v === "update" || v === "edit") {
+    return "update";
+  }
+  if (v === "replace" || v === "set") {
     throw new Error(
-      `${label}.verb: no "update"/"replace"/"set" verb exists for license keys \u2014 a key is not edited in place, only "add"ed or "remove"d. To change which key is installed, submit two separate entries: remove the old key and add the new one.`
+      `${label}.verb: use "update" (alias "edit") to replace an installed license key with another \u2014 "${v}" is not a recognized alias for it.`
     );
   }
   throw new Error(
-    `${label}.verb: must be "add" or "remove" (also accepts "install" as an alias for "add", "uninstall"/"delete" as aliases for "remove"); got ${JSON.stringify(raw)}`
+    `${label}.verb: must be "add", "remove", or "update" (also accepts "install" as an alias for "add", "uninstall"/"delete" as aliases for "remove", "edit" as an alias for "update"); got ${JSON.stringify(raw)}`
   );
 }
 function requireLicenseKey(args) {
@@ -19853,7 +20133,7 @@ function requireLicenseKey(args) {
   }
   return raw.trim();
 }
-var LICENSE_CHANGE_FIELDS = /* @__PURE__ */ new Set(["verb", "key", "id", "name", "licenseKey"]);
+var LICENSE_CHANGE_FIELDS = /* @__PURE__ */ new Set(["verb", "key", "id", "name", "licenseKey", "newKey"]);
 function readLicenseChange(raw, index) {
   const label = `changes[${index}]`;
   if (!isPlainObject2(raw)) {
@@ -19862,7 +20142,7 @@ function readLicenseChange(raw, index) {
   for (const field of Object.keys(raw)) {
     if (!LICENSE_CHANGE_FIELDS.has(field)) {
       throw new Error(
-        `${label}.${field}: unrecognized field \u2014 a license change entry accepts only "verb" and the key itself ("key", or its aliases "id"/"name"/"licenseKey"); no other field is meaningful for this resource.`
+        `${label}.${field}: unrecognized field \u2014 a license change entry accepts only "verb", the key itself ("key", or its aliases "id"/"name"/"licenseKey"), and (verb: "update" only) "newKey"; no other field is meaningful for this resource.`
       );
     }
   }
@@ -19873,7 +20153,25 @@ function readLicenseChange(raw, index) {
       `${label}.key: required (a non-blank license key string; \`id\`/\`name\`/\`licenseKey\` are accepted aliases)`
     );
   }
-  return { verb, key: keyRaw.trim() };
+  const key = keyRaw.trim();
+  if (verb !== "update") {
+    if (raw.newKey !== void 0) {
+      throw new Error(
+        `${label}.newKey: only meaningful for verb "update" \u2014 this entry's verb is "${verb}"`
+      );
+    }
+    return { verb, key };
+  }
+  if (typeof raw.newKey !== "string" || raw.newKey.trim() === "") {
+    throw new Error(
+      `${label}.newKey: required for verb "update" (a non-blank license key string \u2014 the key to install in place of "key")`
+    );
+  }
+  const newKey = raw.newKey.trim();
+  if (newKey === key) {
+    throw new Error(`${label}.newKey: must differ from "key" ("${key}") \u2014 nothing to update`);
+  }
+  return { verb, key, newKey };
 }
 function normalizeLicenseChanges(input) {
   let entries;
@@ -20748,6 +21046,718 @@ function normalizeThemeChanges(input) {
     );
   }
   return entries.map(readThemeChange);
+}
+function normalizeScheduleFolderVerb(raw, label) {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : raw;
+  if (v === "create" || v === "add") {
+    return "create";
+  }
+  if (v === "rename") {
+    return "rename";
+  }
+  if (v === "move") {
+    return "move";
+  }
+  if (v === "delete" || v === "remove") {
+    return "delete";
+  }
+  throw new Error(
+    `${label}.verb: must be "create", "rename", "move", or "delete" (also accepts "add"/"remove" as aliases for "create"/"delete"); got ${JSON.stringify(raw)}`
+  );
+}
+function normalizeScheduleFolderPathForComparison(raw) {
+  if (raw.trim() === "" || raw.trim() === "/") {
+    return "/";
+  }
+  const stripped = raw.trim().replace(/^\/+/, "");
+  return stripped === "" ? "/" : stripped;
+}
+function requireNotSelfOrDescendantMove(path2, targetPath, label) {
+  const p = normalizeScheduleFolderPathForComparison(path2);
+  const t = normalizeScheduleFolderPathForComparison(targetPath);
+  if (t === p || t.startsWith(p + "/")) {
+    throw new Error(
+      `${label}.targetPath: "${targetPath}" is "${path2}" itself or a descendant of it -- a folder cannot be moved into itself or into one of its own subfolders`
+    );
+  }
+}
+function requireScheduleFolderChangePath(raw, label) {
+  if (typeof raw.path !== "string" || raw.path.trim() === "") {
+    throw new Error(`${label}.path: required`);
+  }
+  return raw.path.trim();
+}
+function readScheduleFolderChange(raw, index) {
+  const label = `changes[${index}]`;
+  if (!isPlainObject2(raw)) {
+    throw new Error(`${label}: expected an object like { verb, ... }, got ${typeof raw}`);
+  }
+  const verb = normalizeScheduleFolderVerb(raw.verb, label);
+  if (verb === "create") {
+    for (const f of ["path", "newPath", "targetPath", "force"]) {
+      if (raw[f] !== void 0 && raw[f] !== null) {
+        throw new Error(
+          `${label}.${f}: not used for verb="create"; remove it or use verb="rename"/"move"/"delete"`
+        );
+      }
+    }
+    if (typeof raw.folderName !== "string" || raw.folderName.trim() === "") {
+      throw new Error(`${label}.folderName: required for verb="create" (a leaf name, not a path)`);
+    }
+    const parentPath = typeof raw.parentPath === "string" && raw.parentPath.trim() !== "" ? raw.parentPath.trim() : void 0;
+    return { verb, parentPath, folderName: raw.folderName.trim() };
+  }
+  if (verb === "rename") {
+    for (const f of ["parentPath", "folderName", "targetPath", "force"]) {
+      if (raw[f] !== void 0 && raw[f] !== null) {
+        throw new Error(
+          `${label}.${f}: not used for verb="rename"; remove it or use verb="create"/"move"/"delete"`
+        );
+      }
+    }
+    const path3 = requireScheduleFolderChangePath(raw, label);
+    if (typeof raw.newPath !== "string" || raw.newPath.trim() === "") {
+      throw new Error(`${label}.newPath: required for verb="rename"`);
+    }
+    return { verb, path: path3, newPath: raw.newPath.trim() };
+  }
+  if (verb === "move") {
+    for (const f of ["parentPath", "folderName", "newPath", "force"]) {
+      if (raw[f] !== void 0 && raw[f] !== null) {
+        throw new Error(
+          `${label}.${f}: not used for verb="move"; remove it or use verb="create"/"rename"/"delete"`
+        );
+      }
+    }
+    const path3 = requireScheduleFolderChangePath(raw, label);
+    if (typeof raw.targetPath !== "string" || raw.targetPath.trim() === "") {
+      throw new Error(`${label}.targetPath: required for verb="move"`);
+    }
+    const targetPath = raw.targetPath.trim();
+    requireNotSelfOrDescendantMove(path3, targetPath, label);
+    return { verb, path: path3, targetPath };
+  }
+  for (const f of ["parentPath", "folderName", "newPath", "targetPath"]) {
+    if (raw[f] !== void 0 && raw[f] !== null) {
+      throw new Error(
+        `${label}.${f}: not used for verb="delete"; remove it or use verb="create"/"rename"/"move"`
+      );
+    }
+  }
+  const path2 = requireScheduleFolderChangePath(raw, label);
+  let force;
+  if ("force" in raw && raw.force !== void 0 && raw.force !== null) {
+    if (typeof raw.force !== "boolean") {
+      throw new Error(`${label}.force: must be a boolean; got ${typeof raw.force}`);
+    }
+    force = raw.force;
+  }
+  return { verb, path: path2, force };
+}
+function normalizeScheduleFolderChanges(input) {
+  let entries;
+  if (Array.isArray(input)) {
+    if (input.length === 0) {
+      throw new Error("changes: must not be empty \u2014 pass at least one { verb, ... }");
+    }
+    entries = input;
+  } else if (isPlainObject2(input)) {
+    entries = [input];
+  } else {
+    throw new Error(
+      'changes: required \u2014 an array of { verb, ... } (verb is "create", "rename", "move", or "delete")'
+    );
+  }
+  return entries.map(readScheduleFolderChange);
+}
+function requireScheduleFolderPath(args) {
+  const obj = isPlainObject2(args) ? args : {};
+  const raw = obj.path;
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new Error(
+      `path: required (the schedule-task folder's registry path, e.g. "Finance/Reports")`
+    );
+  }
+  return raw.trim();
+}
+function requireAcknowledgeIrreversibleScheduleFolderDelete(changes, raw, planChanges) {
+  const hasHighRiskDelete = changes.some((c, i) => {
+    if (c.verb !== "delete") {
+      return false;
+    }
+    const planChange = planChanges?.[i];
+    return planChange?.risk === "high";
+  });
+  if (!hasHighRiskDelete) {
+    return void 0;
+  }
+  if (raw !== true) {
+    throw new Error(
+      "acknowledgeIrreversibleDelete: required and must be true \u2014 this plan contains a delete of a NON-EMPTY schedule-task folder, which permanently and irrecoverably deletes every contained schedule task, recursively, with no recycle bin and no rollback. Set acknowledgeIrreversibleDelete:true only after the human reviewing this plan has confirmed they understand this cannot be undone through admin-chat."
+    );
+  }
+  return true;
+}
+function normalizeScheduleConfigUnitType(raw, label) {
+  const folded = typeof raw === "string" ? raw.trim().toLowerCase().replace(/[\s_-]+/g, "") : raw;
+  if (folded === "serverlocation" || folded === "location") {
+    return "serverLocation";
+  }
+  if (folded === "timerange" || folded === "range") {
+    return "timeRange";
+  }
+  throw new Error(
+    `${label}.unitType: must be "serverLocation" or "timeRange" (also accepts "location"/"range" as informal aliases); got ${JSON.stringify(raw)}`
+  );
+}
+function normalizeScheduleConfigVerb(raw, label) {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : raw;
+  if (v === "create" || v === "add") {
+    return "create";
+  }
+  if (v === "update" || v === "set" || v === "modify") {
+    return "update";
+  }
+  if (v === "delete" || v === "remove") {
+    return "delete";
+  }
+  throw new Error(
+    `${label}.verb: must be "create", "update", or "delete" (also accepts "add"/"set"|"modify"/"remove" as aliases); got ${JSON.stringify(raw)}`
+  );
+}
+function normalizeServerLocationSpec(raw, label) {
+  if (!isPlainObject2(raw)) {
+    throw new Error(`${label}.spec: expected an object with path/label, got ${typeof raw}`);
+  }
+  const path2 = typeof raw.path === "string" ? raw.path.trim() : "";
+  if (path2 === "") {
+    throw new Error(`${label}.spec.path: required non-blank string`);
+  }
+  const pathLabel = typeof raw.label === "string" ? raw.label.trim() : "";
+  if (pathLabel === "") {
+    throw new Error(`${label}.spec.label: required non-blank string`);
+  }
+  const useCredential = raw.useCredential === true;
+  const hasSecretId = typeof raw.secretId === "string" && raw.secretId.trim() !== "";
+  const hasUsername = typeof raw.username === "string" && raw.username.trim() !== "";
+  const hasPassword = typeof raw.password === "string" && raw.password !== "";
+  const oldPasswordKey = typeof raw.oldPasswordKey === "string" && raw.oldPasswordKey.trim() !== "" ? raw.oldPasswordKey.trim() : void 0;
+  if (hasPassword && raw.password === MASKED_SCHEDULE_TASK_PASSWORD) {
+    if (oldPasswordKey === void 0) {
+      throw new Error(
+        `${label}.spec.password: this is the masked placeholder list_schedule_server_locations returns on read, not a real password -- pass back the SAME oldPasswordKey that read returned alongside it (required whenever password is the placeholder), or supply the real new password to actually rotate the credential. Sending the placeholder with no oldPasswordKey would persist the literal placeholder string as the real password.`
+      );
+    }
+  }
+  if (useCredential) {
+    if (!hasSecretId) {
+      throw new Error(
+        `${label}.spec.secretId: required when useCredential=true (the credential is resolved by reference, not supplied inline)`
+      );
+    }
+    if (hasUsername || hasPassword) {
+      throw new Error(
+        `${label}.spec.username/password: not used when useCredential=true -- the credential comes from secretId instead; remove username/password or set useCredential=false`
+      );
+    }
+  }
+  const pathInfoModel = {
+    path: path2,
+    useCredential,
+    ftp: typeof raw.ftp === "boolean" ? raw.ftp : hasUsername || hasSecretId || useCredential
+  };
+  if (useCredential) {
+    pathInfoModel.secretId = raw.secretId;
+  } else {
+    if (hasUsername) {
+      pathInfoModel.username = raw.username;
+    }
+    if (hasPassword) {
+      pathInfoModel.password = raw.password;
+    }
+    if (oldPasswordKey !== void 0) {
+      pathInfoModel.oldPasswordKey = oldPasswordKey;
+    }
+  }
+  const hasAnyCredentialField = hasUsername || hasPassword || hasSecretId || useCredential;
+  return {
+    path: path2,
+    label: pathLabel,
+    pathInfoModel: hasAnyCredentialField ? pathInfoModel : void 0
+  };
+}
+function normalizeTimeRangeSpec(raw, label) {
+  if (!isPlainObject2(raw)) {
+    throw new Error(`${label}.spec: expected an object with name/startTime/endTime/defaultRange, got ${typeof raw}`);
+  }
+  const name = typeof raw.name === "string" ? raw.name.trim() : "";
+  if (name === "") {
+    throw new Error(`${label}.spec.name: required non-blank string`);
+  }
+  if (typeof raw.startTime !== "string" || raw.startTime.trim() === "") {
+    throw new Error(`${label}.spec.startTime: required non-blank "HH:mm" (or "HH:mm:ss") string`);
+  }
+  if (typeof raw.endTime !== "string" || raw.endTime.trim() === "") {
+    throw new Error(`${label}.spec.endTime: required non-blank "HH:mm" (or "HH:mm:ss") string`);
+  }
+  if (typeof raw.defaultRange !== "boolean") {
+    throw new Error(
+      `${label}.spec.defaultRange: required boolean -- this is a whole-record replace, so it must be resupplied even when unchanged (true makes this range the default and silently clears the default flag on every other range; false leaves every other range's default flag alone)`
+    );
+  }
+  const spec = {
+    name,
+    startTime: raw.startTime.trim(),
+    endTime: raw.endTime.trim(),
+    defaultRange: raw.defaultRange
+  };
+  if ("permissions" in raw && raw.permissions !== void 0) {
+    spec.permissions = raw.permissions;
+  }
+  if ("modified" in raw && raw.modified !== void 0) {
+    spec.modified = raw.modified;
+  }
+  return spec;
+}
+function readScheduleConfigChange(raw, index) {
+  const label = `changes[${index}]`;
+  if (!isPlainObject2(raw)) {
+    throw new Error(`${label}: expected an object like { unitType, verb, key|spec }, got ${typeof raw}`);
+  }
+  const unitType = normalizeScheduleConfigUnitType(raw.unitType, label);
+  const verb = normalizeScheduleConfigVerb(raw.verb, label);
+  const rawKey = raw.key ?? raw.path ?? raw.name;
+  const key = typeof rawKey === "string" && rawKey.trim() !== "" ? rawKey.trim() : void 0;
+  let force;
+  if ("force" in raw && raw.force !== void 0 && raw.force !== null) {
+    if (typeof raw.force !== "boolean") {
+      throw new Error(`${label}.force: must be a boolean; got ${typeof raw.force}`);
+    }
+    force = raw.force;
+  }
+  if (verb === "delete") {
+    if (key === void 0) {
+      throw new Error(`${label}.key: required for verb="delete" (\`path\`/\`name\` are accepted aliases)`);
+    }
+    if ("spec" in raw && raw.spec !== void 0 && raw.spec !== null) {
+      throw new Error(`${label}.spec: not used for verb="delete"; remove it or use verb="create"/"update"`);
+    }
+    return { unitType, verb, key, force };
+  }
+  if (verb === "update" && key === void 0) {
+    throw new Error(`${label}.key: required for verb="update" (\`path\`/\`name\` are accepted aliases)`);
+  }
+  const spec = unitType === "serverLocation" ? normalizeServerLocationSpec(raw.spec, label) : normalizeTimeRangeSpec(raw.spec, label);
+  return { unitType, verb, key, spec, force };
+}
+function normalizeScheduleConfigChanges(input) {
+  let entries;
+  if (Array.isArray(input)) {
+    if (input.length === 0) {
+      throw new Error("changes: must not be empty \u2014 pass at least one { unitType, verb, key|spec }");
+    }
+    entries = input;
+  } else if (isPlainObject2(input)) {
+    entries = [input];
+  } else {
+    throw new Error(
+      'changes: required \u2014 an array of { unitType, verb, key|spec } (unitType is "serverLocation" or "timeRange"; verb is "create", "update", or "delete")'
+    );
+  }
+  return entries.map(readScheduleConfigChange);
+}
+var LOGGING_FIELD_MAP = [
+  { path: "fileSettings.maxLogSize", property: "report.log.max", type: "number" },
+  { path: "fileSettings.count", property: "report.log.count", type: "number" },
+  { path: "outputToStd", property: "log.output.stderr", type: "boolean" },
+  { path: "detailLevel", property: "log.detail.level", type: "string" },
+  { path: "fluentdSettings.port", property: "log.fluentd.port", type: "number" },
+  { path: "fluentdSettings.host", property: "log.fluentd.host", type: "string" },
+  { path: "fluentdSettings.connectTimeout", property: "log.fluentd.connectTimeout", type: "number" },
+  { path: "fluentdSettings.securityEnabled", property: "log.fluentd.securityEnabled", type: "boolean" },
+  { path: "fluentdSettings.sharedKey", property: "log.fluentd.security.sharedKey", type: "string" },
+  {
+    path: "fluentdSettings.userAuthenticationEnabled",
+    property: "log.fluentd.security.userAuthenticationEnabled",
+    type: "boolean"
+  },
+  { path: "fluentdSettings.username", property: "log.fluentd.security.username", type: "string" },
+  { path: "fluentdSettings.tlsEnabled", property: "log.fluentd.tlsEnabled", type: "boolean" },
+  { path: "fluentdSettings.caCertificateFile", property: "log.fluentd.tls.caCertificateFile", type: "string" },
+  { path: "fluentdSettings.logViewUrl", property: "log.fluentd.logViewUrl", type: "string" },
+  { path: "fluentdSettings.orgAdminAccess", property: "log.fluentd.orgAdminAccess", type: "boolean" }
+];
+var LOGGING_LEVEL_CONTEXTS = [
+  "CATEGORY",
+  "USER",
+  "GROUP",
+  "ROLE",
+  "ORGANIZATION",
+  "REPORT",
+  "DASHBOARD",
+  "QUERY",
+  "MODEL",
+  "WORKSHEET",
+  "SCHEDULE_TASK",
+  "ASSEMBLY",
+  "TABLE"
+];
+var LOGGING_LEVEL_CONTEXT_SET = new Set(LOGGING_LEVEL_CONTEXTS);
+var LOGGING_LEVEL_CLEAR_ALIASES = /* @__PURE__ */ new Set(["clear", "remove", "none", "unset"]);
+function getAtLoggingPath(obj, path2) {
+  const parts = path2.split(".");
+  let cur = obj;
+  for (const part of parts) {
+    if (!isPlainObject2(cur) || !(part in cur)) {
+      return void 0;
+    }
+    cur = cur[part];
+  }
+  return cur;
+}
+function coerceLoggingWriteValue(type, raw, label) {
+  if (raw === null) {
+    return null;
+  }
+  if (type === "boolean") {
+    if (typeof raw !== "boolean") {
+      throw new Error(`${label}: expected a boolean, or null to reset to default; got ${JSON.stringify(raw)}`);
+    }
+    return raw ? "true" : "false";
+  }
+  if (type === "number") {
+    if (typeof raw !== "number" || !Number.isFinite(raw)) {
+      throw new Error(`${label}: expected a number, or null to reset to default; got ${JSON.stringify(raw)}`);
+    }
+    return String(raw);
+  }
+  if (typeof raw !== "string") {
+    throw new Error(`${label}: expected a string, or null to reset to default; got ${JSON.stringify(raw)}`);
+  }
+  return raw;
+}
+function computeLoggingLevelPropertyName(context, name, orgName) {
+  const suffixedName = orgName === void 0 ? name : `${name}^${orgName}`;
+  return context === "CATEGORY" ? `log.level.${suffixedName}` : `log.${context}.level.${suffixedName}`;
+}
+function readLoggingLevelChange(raw, index) {
+  const label = `changes.logLevels[${index}]`;
+  if (!isPlainObject2(raw)) {
+    throw new Error(`${label}: expected an object like { context, name, orgName?, level }, got ${typeof raw}`);
+  }
+  const rawContext = typeof raw.context === "string" ? raw.context.trim().toUpperCase() : raw.context;
+  if (typeof rawContext !== "string" || !LOGGING_LEVEL_CONTEXT_SET.has(rawContext)) {
+    throw new Error(
+      `${label}.context: must be one of ${LOGGING_LEVEL_CONTEXTS.join(", ")}; got ${JSON.stringify(raw.context)}`
+    );
+  }
+  if (typeof raw.name !== "string" || raw.name.trim() === "") {
+    throw new Error(
+      `${label}.name: required non-blank string \u2014 the logger class name for context="CATEGORY", or the user/group/role/organization name for any other context`
+    );
+  }
+  let orgName;
+  if ("orgName" in raw && raw.orgName !== void 0 && raw.orgName !== null) {
+    if (typeof raw.orgName !== "string" || raw.orgName.trim() === "") {
+      throw new Error(`${label}.orgName: must be a non-blank string when present`);
+    }
+    orgName = raw.orgName.trim();
+  }
+  const property = computeLoggingLevelPropertyName(rawContext, raw.name.trim(), orgName);
+  let level = raw.level;
+  if (typeof level === "string" && LOGGING_LEVEL_CLEAR_ALIASES.has(level.trim().toLowerCase())) {
+    level = null;
+  }
+  if (level !== null && (typeof level !== "string" || level.trim() === "")) {
+    throw new Error(
+      `${label}.level: required \u2014 a non-blank level name (e.g. "DEBUG", "INFO", "WARN", "ERROR", "OFF"), or null to REMOVE this override entirely (also accepts "clear"/"remove"/"none"/"unset" as case-insensitive aliases for null). IMPORTANT: "OFF" is a REAL, distinct level \u2014 it silences the logger, but the override itself still exists \u2014 it is NOT an alias for clearing/removing the override; use null (or one of the clear aliases) for that.`
+    );
+  }
+  return { property, value: level === null ? null : level.trim().toUpperCase() };
+}
+function readLoggingChangeEntry(raw) {
+  if (!isPlainObject2(raw)) {
+    throw new Error(
+      `changes: expected a partial-field object shaped like LogSettingsModel (fileSettings, fluentdSettings, outputToStd, detailLevel, provider, logLevels); got ${typeof raw}`
+    );
+  }
+  if (getAtLoggingPath(raw, "fileSettings.file") !== void 0) {
+    throw new Error(
+      "changes.fileSettings.file: read-only \u2014 this field is derived from the server's current log file location (logManager.getBaseLogFile) and has no backing SreeEnv property at all; it is never written by the underlying settings service. Remove it from changes; it cannot be set."
+    );
+  }
+  if (getAtLoggingPath(raw, "fluentdSettings.password") !== void 0) {
+    throw new Error(
+      "changes.fluentdSettings.password: refused for both reading and writing \u2014 its name matches the secret pattern even though its value is plaintext, the identical treatment changeTools.ts's log.fluentd.security.password already gets. Use Enterprise Manager directly to set it."
+    );
+  }
+  const propertyChanges = [];
+  for (const field of LOGGING_FIELD_MAP) {
+    const value = getAtLoggingPath(raw, field.path);
+    if (value === void 0) {
+      continue;
+    }
+    propertyChanges.push({
+      property: field.property,
+      value: coerceLoggingWriteValue(field.type, value, `changes.${field.path}`)
+    });
+  }
+  const logLevels = raw.logLevels;
+  if (logLevels !== void 0 && logLevels !== null) {
+    if (!Array.isArray(logLevels)) {
+      throw new Error(`changes.logLevels: expected an array of { context, name, orgName?, level }, got ${typeof logLevels}`);
+    }
+    logLevels.forEach((entry, index) => propertyChanges.push(readLoggingLevelChange(entry, index)));
+  }
+  let providerValue;
+  const rawProvider = raw.provider;
+  if (rawProvider !== void 0 && rawProvider !== null) {
+    const folded = typeof rawProvider === "string" ? rawProvider.trim().toLowerCase() : rawProvider;
+    if (folded !== "file" && folded !== "fluentd") {
+      throw new Error(`changes.provider: must be "file" or "fluentd"; got ${JSON.stringify(rawProvider)}`);
+    }
+    providerValue = folded;
+  }
+  const seen = /* @__PURE__ */ new Map();
+  for (const change of propertyChanges) {
+    const fold = change.property.toLowerCase();
+    const prior = seen.get(fold);
+    if (prior !== void 0) {
+      throw new Error(
+        `changes: duplicate property "${change.property}"` + (prior === change.property ? "" : ` (already present as "${prior}")`) + " \u2014 list each logLevels entry's (context, name, orgName) combination at most once"
+      );
+    }
+    seen.set(fold, change.property);
+  }
+  return { propertyChanges, providerValue };
+}
+function normalizeLoggingChanges(input) {
+  if (Array.isArray(input)) {
+    if (input.length === 0) {
+      throw new Error("changes: must not be empty \u2014 pass a partial-field object shaped like LogSettingsModel");
+    }
+    if (input.length > 1) {
+      throw new Error(
+        "changes: this area manages ONE flat logging-settings resource, not multiple named units \u2014 pass a single partial-field object (or a one-element array containing it) covering every field to change at once, not several separate array entries."
+      );
+    }
+    return readLoggingChangeEntry(input[0]);
+  }
+  if (isPlainObject2(input)) {
+    return readLoggingChangeEntry(input);
+  }
+  throw new Error(
+    "changes: required \u2014 a partial-field object shaped like LogSettingsModel (fileSettings, fluentdSettings, outputToStd, detailLevel, provider, logLevels)"
+  );
+}
+function normalizeScriptLibraryVerb(raw, label) {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (v === "create") {
+    return "create";
+  }
+  if (v === "rename") {
+    return "rename";
+  }
+  if (v === "update") {
+    return "update";
+  }
+  if (v === "delete" || v === "remove") {
+    return "delete";
+  }
+  throw new Error(
+    `${label}.verb: must be "create", "rename", "update", or "delete" ("remove" accepted as an alias for "delete"); got ${JSON.stringify(raw)}`
+  );
+}
+function requireScriptLibraryName(raw, label) {
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new Error(`${label}.name: required \u2014 the script's current name (or, for verb="create", the name to give the new script)`);
+  }
+  return raw.trim();
+}
+function requireScriptLibraryUnused(raw, field, label) {
+  if (raw !== void 0 && raw !== null) {
+    throw new Error(`${label}.${field}: not used for this verb \u2014 remove it or use the right verb`);
+  }
+}
+function readScriptLibraryChange(raw, index) {
+  const label = `changes[${index}]`;
+  if (!isPlainObject2(raw)) {
+    throw new Error(
+      `${label}: expected an object like { verb, name, newName, description, text, force }, got ${typeof raw}`
+    );
+  }
+  const verb = normalizeScriptLibraryVerb(raw.verb, label);
+  const name = requireScriptLibraryName(raw.name, label);
+  if (verb === "create") {
+    requireScriptLibraryUnused(raw.newName, "newName", label);
+    requireScriptLibraryUnused(raw.force, "force", label);
+    if (raw.description !== void 0 && raw.description !== null && typeof raw.description !== "string") {
+      throw new Error(`${label}.description: must be a string when present; got ${typeof raw.description}`);
+    }
+    if (raw.text !== void 0 && raw.text !== null && typeof raw.text !== "string") {
+      throw new Error(`${label}.text: must be a string when present; got ${typeof raw.text}`);
+    }
+    return {
+      verb,
+      name,
+      ...typeof raw.description === "string" ? { description: raw.description } : {},
+      ...typeof raw.text === "string" ? { text: raw.text } : {}
+    };
+  }
+  if (verb === "rename") {
+    requireScriptLibraryUnused(raw.description, "description", label);
+    requireScriptLibraryUnused(raw.text, "text", label);
+    requireScriptLibraryUnused(raw.force, "force", label);
+    if (typeof raw.newName !== "string" || raw.newName.trim() === "") {
+      throw new Error(`${label}.newName: required \u2014 the new name for "${name}"`);
+    }
+    return { verb, name, newName: raw.newName.trim() };
+  }
+  if (verb === "update") {
+    requireScriptLibraryUnused(raw.newName, "newName", label);
+    requireScriptLibraryUnused(raw.text, "text", label);
+    requireScriptLibraryUnused(raw.force, "force", label);
+    if (typeof raw.description !== "string") {
+      throw new Error(
+        `${label}: nothing to change \u2014 verb="update" requires a string "description" (pass "" to clear it)`
+      );
+    }
+    return { verb, name, description: raw.description };
+  }
+  requireScriptLibraryUnused(raw.newName, "newName", label);
+  requireScriptLibraryUnused(raw.description, "description", label);
+  requireScriptLibraryUnused(raw.text, "text", label);
+  if (raw.force !== void 0 && raw.force !== null && typeof raw.force !== "boolean") {
+    throw new Error(`${label}.force: must be boolean when present; got ${typeof raw.force}`);
+  }
+  return { verb, name, ...typeof raw.force === "boolean" ? { force: raw.force } : {} };
+}
+function normalizeScriptLibraryChanges(input) {
+  let entries;
+  if (Array.isArray(input)) {
+    if (input.length === 0) {
+      throw new Error("changes: must not be empty \u2014 pass at least one { verb, name, ... }");
+    }
+    entries = input;
+  } else if (isPlainObject2(input)) {
+    entries = [input];
+  } else {
+    throw new Error(
+      'changes: required \u2014 an array of { verb, name, newName, description, text, force } (verb is "create", "rename", "update", or "delete")'
+    );
+  }
+  return entries.map(readScriptLibraryChange);
+}
+function requireAcknowledgeIrreversibleScriptLibraryDelete(changes, raw) {
+  const hasDelete = changes.some((c) => c.verb === "delete");
+  if (!hasDelete) {
+    return void 0;
+  }
+  if (raw !== true) {
+    throw new Error(
+      "acknowledgeIrreversibleDelete: required and must be true because this plan contains a delete entry \u2014 the script's own content is captured and would be restored if this change is later rolled back, but anything calling it by name will break for as long as the deletion stands. Set it only after the human reviewing this plan has confirmed they understand this."
+    );
+  }
+  return true;
+}
+function normalizeAutoSaveRecycleBinVerb(raw, label) {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (v === "restore") {
+    return "restore";
+  }
+  if (v === "delete" || v === "remove" || v === "purge") {
+    return "delete";
+  }
+  throw new Error(
+    `${label}.verb: must be "restore" or "delete" ("remove"/"purge" accepted as aliases for "delete"); got ${JSON.stringify(raw)}`
+  );
+}
+function requireAutoSaveRecycleBinId(raw, label) {
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new Error(
+      `${label}.id: required \u2014 the entry's storage key exactly as returned by list_autosave_entries/get_autosave_entry, never hand-constructed`
+    );
+  }
+  return raw.trim();
+}
+function readAutoSaveRecycleBinChange(raw, index) {
+  const label = `changes[${index}]`;
+  if (!isPlainObject2(raw)) {
+    throw new Error(
+      `${label}: expected an object like { verb, id, assetName, overwrite }, got ${typeof raw}`
+    );
+  }
+  const verb = normalizeAutoSaveRecycleBinVerb(raw.verb, label);
+  const id = requireAutoSaveRecycleBinId(raw.id, label);
+  if (verb === "delete") {
+    if (raw.assetName !== void 0 && raw.assetName !== null) {
+      throw new Error(`${label}.assetName: not used for verb="delete"; remove it or use verb="restore"`);
+    }
+    if (raw.overwrite !== void 0 && raw.overwrite !== null) {
+      throw new Error(`${label}.overwrite: not used for verb="delete"; remove it or use verb="restore"`);
+    }
+    return { verb, id };
+  }
+  const change = { verb, id };
+  if (raw.assetName !== void 0 && raw.assetName !== null) {
+    if (typeof raw.assetName !== "string" || raw.assetName.trim() === "") {
+      throw new Error(`${label}.assetName: must be a non-blank string when present`);
+    }
+    change.assetName = raw.assetName.trim();
+  }
+  if (raw.overwrite !== void 0 && raw.overwrite !== null) {
+    if (typeof raw.overwrite !== "boolean") {
+      throw new Error(`${label}.overwrite: must be boolean when present; got ${typeof raw.overwrite}`);
+    }
+    change.overwrite = raw.overwrite;
+  }
+  return change;
+}
+function normalizeAutoSaveRecycleBinChanges(input) {
+  let entries;
+  if (Array.isArray(input)) {
+    if (input.length === 0) {
+      throw new Error("changes: must not be empty \u2014 pass at least one { verb, id }");
+    }
+    entries = input;
+  } else if (isPlainObject2(input)) {
+    entries = [input];
+  } else {
+    throw new Error(
+      'changes: required \u2014 an array of { verb, id, assetName, overwrite } (verb is "restore" or "delete")'
+    );
+  }
+  return entries.map(readAutoSaveRecycleBinChange);
+}
+function requireAcknowledgeIrreversibleAutoSaveRecycleBinDelete(changes, raw, planChanges) {
+  const hasDelete = changes.some((c) => c.verb === "delete");
+  const hasHighRiskRestore = changes.some((c, i) => {
+    if (c.verb !== "restore") {
+      return false;
+    }
+    const planChange = planChanges?.[i];
+    return planChange?.risk === "high";
+  });
+  if (!hasDelete && !hasHighRiskRestore) {
+    return void 0;
+  }
+  if (raw !== true) {
+    const causes = [];
+    if (hasDelete) {
+      causes.push(
+        "a delete entry \u2014 the draft's own content is captured and would be restored if this change is later rolled back, but it is gone for as long as the deletion stands"
+      );
+    }
+    if (hasHighRiskRestore) {
+      causes.push(
+        "a restore entry whose destination is already occupied, accepted via overwrite:true \u2014 restoring PERMANENTLY DESTROYS the existing asset currently at that path"
+      );
+    }
+    throw new Error(
+      "acknowledgeIrreversibleDelete: required and must be true because this plan contains " + causes.join(" and ") + ". Set it only after the human reviewing this plan has confirmed they understand this."
+    );
+  }
+  return true;
 }
 
 // src/tools/orgValidation.ts
@@ -21745,6 +22755,331 @@ function makeAuditTools(deps) {
   ];
 }
 
+// src/tools/scheduleFolderTools.ts
+var TASK_SCHEMA3 = {
+  type: "string",
+  description: "a short description of what this change accomplishes; written into every audit record for the transaction"
+};
+var CHANGES_SCHEMA3 = {
+  type: "array",
+  description: "the proposed schedule-task FOLDER changes; each entry names verb FIRST \u2014 set it correctly before adding other fields, since a field belonging to a different verb is refused loud, never silently dropped. List each folder path at most once. IMPORTANT: unlike a viewsheet folder, a schedule-task folder DELETE is a REAL, unconditional, RECURSIVE physical delete of every schedule task stored under it (and every nested folder) \u2014 there is no recycle bin and no server-side safety net beyond this plugin's own force/acknowledgement gate. Do not assume the registry-label-only framing viewsheet folder delete uses; it does not apply here.",
+  items: {
+    type: "object",
+    properties: {
+      verb: {
+        type: "string",
+        description: `"create", "rename", "move", or "delete" (also accepts "add"/"remove" as aliases for "create"/"delete"). Unlike viewsheet folder verbs, "move" is NOT an alias for "rename" here \u2014 they are genuinely different operations: rename changes only a folder's own leaf name in place; move relocates it under a different parent folder, keeping its own leaf name. There is no "update" verb in this area \u2014 a schedule-task folder has no alias/description field to update at all.`
+      },
+      path: {
+        type: "string",
+        description: `verb="rename"/"move"/"delete" only, required \u2014 the folder's current registry path (e.g. "Finance/Reports"), NOT used for verb="create" (use parentPath/folderName instead). Root ("/") can never be the target of rename/move/delete \u2014 refused loud. IMPORTANT for delete: this PERMANENTLY AND IRRECOVERABLY deletes every schedule task stored under this path, recursively including nested folders \u2014 there is no recycle bin and no undo. IMPORTANT for rename/move: this rewrites the path/asset-identifier of every schedule task and subfolder currently stored under it, recursively \u2014 any external reference to those tasks (e.g. a completion condition naming a task by id) can go stale as a result.`
+      },
+      parentPath: {
+        type: "string",
+        description: 'verb="create" only, optional (root if omitted) \u2014 the parent folder the new folder is created under. Missing ancestor folders along this path are auto-created ("mkdir -p"-shaped, disclosed behavior, not a safety gap \u2014 creating a folder label has no destructive effect).'
+      },
+      folderName: {
+        type: "string",
+        description: `verb="create" only, required \u2014 the new folder's own leaf name, not a full path.`
+      },
+      newPath: {
+        type: "string",
+        description: `verb="rename" only, required \u2014 path's new full path. Cannot resolve to root ("/") \u2014 refused loud.`
+      },
+      targetPath: {
+        type: "string",
+        description: `verb="move" only, required \u2014 the destination parent folder path is relocated under. Unlike path, targetPath MAY be root ("/") \u2014 moving a folder to the top level is a legitimate, ordinary operation. Moving a folder into itself or into one of its own subfolders is refused loud, naming both path and targetPath, BEFORE any server call is made \u2014 the underlying StyleBI primitive this wraps has a real, independent defect here (a raw string-prefix check) that otherwise either silently no-ops (HTTP 200, nothing happens) on a true self/descendant move, or false-positives on an unrelated sibling whose name merely shares a string prefix (e.g. moving "Finance" into "FinanceArchive") \u2014 this plugin's own check is correct in both directions and runs independently of that primitive.`
+      },
+      force: {
+        type: "boolean",
+        description: 'verb="delete" only, default false \u2014 required (true) whenever the folder is non-empty (contains any schedule task, recursively). preview_schedule_task_folder_changes classifies that entry risk:"high" and names the contained task count; apply_schedule_task_folder_changes refuses a non-empty folder delete without BOTH force:true on this entry AND acknowledgeIrreversibleDelete:true on the request. Not used/required for an empty folder delete (risk:"low"), and not used for verb="create"/"rename"/"move".'
+      }
+    },
+    required: ["verb"]
+  }
+};
+function makeGetScheduleTaskFolderTool(deps) {
+  return {
+    name: "get_schedule_task_folder",
+    description: 'Read one schedule-task folder: its owner and the registry paths of its direct child folders. `found:false` is a normal answer, not an error (mirrors get_viewsheet_folder\'s own convention) \u2014 most paths have no folder there. This is NOT the same thing as "does this folder contain any schedule tasks" \u2014 a folder can exist with none, and tasks can exist under a path with no explicit folder entry covering it.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: `the folder's registry path, e.g. "Finance/Reports"` }
+      },
+      required: ["path"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const path2 = requireScheduleFolderPath(args ?? {});
+      return deps.wizClient.get(`/v1/admin/schedule/folders?path=${encodeURIComponent(path2)}`);
+    }
+  };
+}
+function makePreviewScheduleTaskFolderChangesTool(deps) {
+  return {
+    name: "preview_schedule_task_folder_changes",
+    description: `Resolve a set of proposed schedule-task FOLDER creates/renames/moves/deletes into a reviewable plan WITHOUT changing anything on the server. requiresAgentSignoff is unconditionally true for EVERY plan in this area, regardless of verb or risk \u2014 unlike Viewsheets' own folder verbs, this area has no low-risk "update" verb to make a common all-low-risk case (a schedule-task folder sits in the same trust boundary as the tasks it contains: delivery credentials, executeAs identities). requiresStorageBackup is always true. Per-entry risk still varies the way Viewsheets' own folder verbs do: create/rename/move are risk:"low" (nothing is destroyed); delete is risk:"low" when the folder is empty, risk:"high" when it is not (naming the contained task count). READ THIS BEFORE PREVIEWING A DELETE: unlike a viewsheet folder, this PERMANENTLY AND IRRECOVERABLY deletes every schedule task stored under the folder, recursively including nested folders \u2014 there is no recycle bin and no server-side safety net beyond this plugin's own gate (force + acknowledgeIrreversibleDelete). READ THIS BEFORE PREVIEWING A RENAME OR MOVE: both rewrite the path/asset-identifier of every schedule task and subfolder currently stored under the folder, recursively \u2014 any external reference to those tasks by id (e.g. a completion condition) can go stale as a result. You MUST pass the returned planHash AND taskToken to apply_schedule_task_folder_changes \u2014 the server writes the audit record from the task narrative embedded in taskToken, never from whatever task text apply_schedule_task_folder_changes is itself called with.`,
+    inputSchema: {
+      type: "object",
+      properties: { task: TASK_SCHEMA3, changes: CHANGES_SCHEMA3 },
+      required: ["task", "changes"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      return deps.wizClient.post("/v1/admin/schedule/folders/preview", {
+        task: requireTask(args?.task),
+        changes: normalizeScheduleFolderChanges(args?.changes)
+      });
+    }
+  };
+}
+async function resolveScheduleFolderDeleteRisks(deps, task, changes) {
+  const preview = await deps.wizClient.post("/v1/admin/schedule/folders/preview", { task, changes });
+  const planChanges = preview?.changes;
+  return Array.isArray(planChanges) ? planChanges : void 0;
+}
+function makeApplyScheduleTaskFolderChangesTool(deps) {
+  return {
+    name: "apply_schedule_task_folder_changes",
+    description: `Apply a previewed schedule-task folder plan. Pass back the SAME task and changes you previewed plus the planHash AND taskToken from preview_schedule_task_folder_changes \u2014 the request body IS the plan; the server never trusts a stored one. reviewOutcome is required unconditionally (every plan in this area is high-risk, regardless of verb). If the plan contains a delete of a NON-EMPTY folder (preview_schedule_task_folder_changes classified that entry risk:"high") you MUST also pass force:true on that entry AND acknowledgeIrreversibleDelete:true on the request \u2014 it permanently and irrecoverably deletes every schedule task stored under it, recursively, with no recycle bin and no rollback. An empty-folder delete (risk:"low") needs neither flag. Result status is one of: "applied", "rolled-back" (something failed and every applied change was undone \u2014 note a delete's own "rollback" only restores the empty folder LABEL, it does NOT restore any schedule task that was destroyed, since there is no snapshot to recreate them from), "rollback-failed" (the server may be PARTIALLY CHANGED \u2014 escalate, do not retry), or "conflict" (the plan drifted, nothing was applied).`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: TASK_SCHEMA3,
+        changes: CHANGES_SCHEMA3,
+        planHash: {
+          type: "string",
+          description: "the planHash returned by preview_schedule_task_folder_changes for this exact plan"
+        },
+        taskToken: {
+          type: "string",
+          description: "the taskToken returned by preview_schedule_task_folder_changes for this exact plan. The server writes the audit record from the task narrative embedded in this token, not from this call's own task field."
+        },
+        reviewOutcome: {
+          type: "string",
+          description: "the reviewer's verdict, recorded on every audit record; always required in this area"
+        },
+        acknowledgeIrreversibleDelete: {
+          type: "boolean",
+          description: 'required and must be true whenever changes contains a delete entry that preview_schedule_task_folder_changes classified risk:"high" (a non-empty folder \u2014 that entry also needs force:true). Not required when the plan contains no delete verb, or only an empty-folder delete (risk:"low"). Omit entirely when not required.'
+        }
+      },
+      required: ["task", "changes", "planHash", "taskToken"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      if (typeof args?.planHash !== "string" || args.planHash.trim() === "") {
+        throw new Error(
+          "planHash: required \u2014 the hash returned by preview_schedule_task_folder_changes for this plan. Call preview_schedule_task_folder_changes first."
+        );
+      }
+      if (typeof args?.taskToken !== "string" || args.taskToken.trim() === "") {
+        throw new Error(
+          "taskToken: required \u2014 the token returned by preview_schedule_task_folder_changes for this plan. Without it the server cannot verify which reviewed task narrative to audit. Call preview_schedule_task_folder_changes first."
+        );
+      }
+      const changes = normalizeScheduleFolderChanges(args.changes);
+      const task = requireTask(args.task);
+      const hasDelete = changes.some((c) => c.verb === "delete");
+      const planChanges = hasDelete ? await resolveScheduleFolderDeleteRisks(deps, task, changes) : void 0;
+      const acknowledgeIrreversibleDelete = requireAcknowledgeIrreversibleScheduleFolderDelete(
+        changes,
+        args.acknowledgeIrreversibleDelete,
+        planChanges
+      );
+      const body = {
+        task,
+        changes,
+        planHash: args.planHash.trim(),
+        taskToken: args.taskToken.trim()
+      };
+      const reviewOutcome = normalizeReviewOutcome(args.reviewOutcome);
+      if (reviewOutcome !== void 0) {
+        body.reviewOutcome = reviewOutcome;
+      }
+      if (acknowledgeIrreversibleDelete !== void 0) {
+        body.acknowledgeIrreversibleDelete = acknowledgeIrreversibleDelete;
+      }
+      try {
+        return await deps.wizClient.post("/v1/admin/schedule/folders/apply", body);
+      } catch (err) {
+        const e = err;
+        if (e?.code === "HTTP_409") {
+          const detail = e.detail ?? {};
+          return {
+            status: "conflict",
+            error: typeof detail.error === "string" ? detail.error : e.message ?? "the plan no longer matches the planHash",
+            plan: detail.plan ?? null,
+            guidance: "The plan drifted between preview_schedule_task_folder_changes and apply_schedule_task_folder_changes \u2014 the named folder, or its contents, changed by someone else in between. NOTHING was applied. Show the returned `plan` to the user as a fresh diff, get confirmation again, then call apply_schedule_task_folder_changes with the planHash from THAT plan."
+          };
+        }
+        throw err;
+      }
+    }
+  };
+}
+function makeScheduleFolderTools(deps) {
+  return [
+    makeGetScheduleTaskFolderTool(deps),
+    makePreviewScheduleTaskFolderChangesTool(deps),
+    makeApplyScheduleTaskFolderChangesTool(deps)
+  ];
+}
+
+// src/tools/scheduleSettingsTools.ts
+var TASK_SCHEMA4 = {
+  type: "string",
+  description: "a short description of what this change accomplishes; written into every audit record for the transaction"
+};
+var CHANGES_SCHEMA4 = {
+  type: "array",
+  description: 'the proposed Server Location/Time Range changes; each entry names unitType FIRST. A single plan may freely mix unitType="serverLocation" and unitType="timeRange" entries \u2014 both are fields of the same underlying configuration, but Server Locations and Time Ranges do NOT share key/spec shapes, so mixing verbs or spec fields across the wrong unitType is refused loud, never silently misapplied.',
+  items: {
+    type: "object",
+    properties: {
+      unitType: {
+        type: "string",
+        description: `"serverLocation" or "timeRange" (also accepts the informal aliases "location"/"range"). A Server Location is a picklist convenience only \u2014 schedule tasks copy its path into their own saved action at pick-time, so deleting/renaming one cannot change the behavior of any already-saved task, and this area has no dependency check for it (confirmed by tracing the actual data flow, not assumed). A Time Range is a LIVE name reference \u2014 a schedule task's own time condition re-resolves it by name every time the list changes, so delete/update on one IS gated by a dependency check (see the force field below).`
+      },
+      verb: {
+        type: "string",
+        description: '"create", "update", or "delete" (also accepts "add" for create, "set"/"modify" for update, "remove" for delete)'
+      },
+      key: {
+        type: "string",
+        description: 'required for verb="update"/"delete" (not used for verb="create", whose key comes from spec instead) \u2014 a Server Location\'s own path, or a Time Range\'s own name, exactly as returned by list_schedule_server_locations/list_schedule_time_ranges. `path`/`name` are accepted aliases for this same field.'
+      },
+      spec: {
+        type: "object",
+        description: `required for verb="create"/"update"; not used for verb="delete". For unitType="serverLocation": {path, label, username?, password?, secretId?, useCredential?, ftp?, oldPasswordKey?} \u2014 a FLAT shape (this tool builds the nested pathInfoModel the server actually stores internally). useCredential=true requires secretId and forbids username/password; useCredential=false (the default) allows username+password. CREDENTIAL SAFETY: password is read back MASKED (a fixed placeholder string) by list_schedule_server_locations, alongside an opaque oldPasswordKey. If you are NOT rotating the password on an update, resupply the placeholder password TOGETHER WITH the same oldPasswordKey a fresh read returned \u2014 omitting oldPasswordKey while sending the placeholder is refused loud (it would otherwise silently persist the literal placeholder as the real password). The placeholder+oldPasswordKey pair is safe to resend unchanged even when path/label/username are ALSO changing in the same update \u2014 the server resolves oldPasswordKey by a direct lookup against its own pre-write state, not by recomputing an expected key from the new identifying fields, so a rename and an unrotated password can be combined in one call. For unitType="timeRange": {name, startTime, endTime, defaultRange, permissions?, modified?} \u2014 startTime/endTime are "HH:mm" or "HH:mm:ss" LOCAL TIME strings, not epoch millis. This is a WHOLE-RECORD REPLACE: every field must be resupplied on an update even if only one is actually changing (there is no partial-patch semantics here). Setting defaultRange=true on one entry silently clears defaultRange on every other time range in the same write, matching the real Enterprise Manager dialog's own client-side behavior \u2014 this is expected, not a bug, and this area's own preview-time pre-check accounts for it (a duplicate-default error will not spuriously fire because of it). permissions/modified are opaque pass-through fields (no permission-editing on a time range in this area's first cut) \u2014 resupply exactly what a fresh read returned, or omit both.`
+      },
+      force: {
+        type: "boolean",
+        description: `default false. Only meaningful for unitType="timeRange", verb="delete", or an IDENTITY-CHANGING verb="update" (name/startTime/endTime differs from the current stored entry). If any live schedule task's time condition currently resolves to this time range, the change is refused BY DEFAULT, naming the affected task(s) and \u2014 this is the important part \u2014 EXACTLY what each would be SILENTLY reassigned to if applied unchecked (the server computes the same closest-match reassignment TaskBalancer itself would perform): deleting or identity-changing a referenced time range does not merely risk breaking a task, it ALWAYS succeeds server-side and silently changes when that task actually fires, with no error and no log line \u2014 the only way to know is this advisory. force=true allows the change through anyway, and the same advisory is then carried forward on the result rather than disappearing. Not used for unitType="serverLocation" (no live reference exists to check \u2014 see unitType's own description) or for a non-identity-changing Time Range update.`
+      }
+    },
+    required: ["unitType", "verb"]
+  }
+};
+function makeListScheduleServerLocationsTool(deps) {
+  return {
+    name: "list_schedule_server_locations",
+    description: "List configured Schedule Settings Server Locations \u2014 named, reusable disk/FTP path presets a schedule task's own save-to-server-file action can pick from. A stored password comes back as a fixed masked placeholder, never the real value, paired with an opaque oldPasswordKey that preview_schedule_config_changes' own spec.password/oldPasswordKey round-trip discipline needs to preserve it unchanged on an update. Community tier \u2014 no enterprise permission gate beyond the ordinary Schedule Settings EM permission.",
+    inputSchema: { type: "object", properties: {} },
+    call: async () => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const response = await deps.wizClient.get("/v1/admin/schedule/config");
+      const record = typeof response === "object" && response !== null ? response : {};
+      return { serverLocations: record.serverLocations ?? [] };
+    }
+  };
+}
+function makeListScheduleTimeRangesTool(deps) {
+  return {
+    name: "list_schedule_time_ranges",
+    description: "List configured Schedule Settings Time Ranges \u2014 named windows a schedule task's time condition can be pinned to, so the server load-balances that task's actual run time somewhere inside the window rather than at one fixed instant. At most one range has defaultRange:true. A time range's name is a LIVE reference a task's own condition re-resolves by name \u2014 see preview_schedule_config_changes' own force field for why deleting/renaming a referenced range needs care. Community tier.",
+    inputSchema: { type: "object", properties: {} },
+    call: async () => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const response = await deps.wizClient.get("/v1/admin/schedule/config");
+      const record = typeof response === "object" && response !== null ? response : {};
+      return { timeRanges: record.timeRanges ?? [] };
+    }
+  };
+}
+function makePreviewScheduleConfigChangesTool(deps) {
+  return {
+    name: "preview_schedule_config_changes",
+    description: "Resolve a set of proposed Server Location/Time Range creates/updates/deletes into a reviewable plan WITHOUT changing anything on the server. Every change in this area is always high risk (requiresAgentSignoff is always true) but never requires a storage snapshot (requiresStorageBackup is always false) \u2014 both sub-resources are ordinary, restart-durable server-property state with no non-compensable-delete shape (a deleted entry is trivially re-creatable from the same spec), unlike a data source/identity/organization delete. A duplicate Time Range name, or more than one Time Range marked defaultRange:true, is refused here at preview time \u2014 naming the field \u2014 rather than reaching the server as a bare, unnamed error. A Server Location whose label or path conflicts with (or path-contains) an existing one is refused the same way. You MUST pass the returned planHash AND taskToken to apply_schedule_config_changes: the server re-resolves the plan and refuses with a conflict if anything drifted (including a concurrent edit through Enterprise Manager directly, or another agent call), and writes the audit record from the task narrative embedded in taskToken \u2014 the one reviewed here \u2014 never from whatever task text apply_schedule_config_changes itself is called with. Community tier \u2014 there is no enterprise Public API layer for either sub-resource to gate behind.",
+    inputSchema: {
+      type: "object",
+      properties: { task: TASK_SCHEMA4, changes: CHANGES_SCHEMA4 },
+      required: ["task", "changes"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const task = requireTask(args?.task);
+      const changes = normalizeScheduleConfigChanges(args?.changes);
+      return deps.wizClient.post("/v1/admin/schedule/config/preview", { task, changes });
+    }
+  };
+}
+function makeApplyScheduleConfigChangesTool(deps) {
+  return {
+    name: "apply_schedule_config_changes",
+    description: `Apply a previewed Server Location/Time Range change plan. Pass back the SAME task and changes you previewed plus the planHash AND taskToken from preview_schedule_config_changes \u2014 the request body IS the plan; the server never trusts a stored one. reviewOutcome is always required (every plan in this area is high risk). Result status is one of: "applied" (every change verified), "rolled-back" (something failed and the ENTIRE configuration was restored to its pre-apply state \u2014 this area writes the whole underlying configuration model in one call, so rollback is whole-model too, not per-entry), "rollback-failed" (the server may be PARTIALLY CHANGED \u2014 escalate to the operator, do not retry), or "conflict" (the plan drifted and NOTHING was applied). For a Time Range delete/identity-changing-update applied with force:true against a referenced range, the affected-task advisory is relayed verbatim in that entry's own result \u2014 always show it to the operator, since it names exactly what would otherwise have silently changed.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: TASK_SCHEMA4,
+        changes: CHANGES_SCHEMA4,
+        planHash: {
+          type: "string",
+          description: "the planHash returned by preview_schedule_config_changes for this exact plan"
+        },
+        taskToken: {
+          type: "string",
+          description: "the taskToken returned by preview_schedule_config_changes for this exact plan. The server writes the audit record from the task narrative embedded in this token, not from this call's own task field."
+        },
+        reviewOutcome: {
+          type: "string",
+          description: "the reviewer's verdict, recorded on every audit record; always required in this area"
+        }
+      },
+      required: ["task", "changes", "planHash", "taskToken"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      if (typeof args?.planHash !== "string" || args.planHash.trim() === "") {
+        throw new Error(
+          "planHash: required \u2014 the hash returned by preview_schedule_config_changes for this plan. Call preview_schedule_config_changes first."
+        );
+      }
+      if (typeof args?.taskToken !== "string" || args.taskToken.trim() === "") {
+        throw new Error(
+          "taskToken: required \u2014 the token returned by preview_schedule_config_changes for this plan. Call preview_schedule_config_changes first."
+        );
+      }
+      const task = requireTask(args.task);
+      const changes = normalizeScheduleConfigChanges(args.changes);
+      const body = {
+        task,
+        changes,
+        planHash: args.planHash.trim(),
+        taskToken: args.taskToken.trim()
+      };
+      const reviewOutcome = normalizeReviewOutcome(args.reviewOutcome);
+      if (reviewOutcome !== void 0) {
+        body.reviewOutcome = reviewOutcome;
+      }
+      try {
+        return await deps.wizClient.post("/v1/admin/schedule/config/apply", body);
+      } catch (err) {
+        const e = err;
+        if (e?.code === "HTTP_409") {
+          const detail = e.detail ?? {};
+          return {
+            status: "conflict",
+            error: typeof detail.error === "string" ? detail.error : e.message ?? "the plan no longer matches the planHash",
+            plan: detail.plan ?? null,
+            guidance: "The plan drifted between preview_schedule_config_changes and apply_schedule_config_changes \u2014 a Server Location or Time Range was changed by someone else in between (including through Enterprise Manager directly). NOTHING was applied. Show the returned `plan` to the user as a fresh diff, get confirmation again, then call preview_schedule_config_changes again and use THAT response's planHash and taskToken."
+          };
+        }
+        throw err;
+      }
+    }
+  };
+}
+function makeScheduleSettingsTools(deps) {
+  return [
+    makeListScheduleServerLocationsTool(deps),
+    makeListScheduleTimeRangesTool(deps),
+    makePreviewScheduleConfigChangesTool(deps),
+    makeApplyScheduleConfigChangesTool(deps)
+  ];
+}
+
 // src/tools/permissionTools.ts
 function requireResourcePath(raw, label = "resourcePath") {
   if (typeof raw !== "string" || raw.trim() === "") {
@@ -21752,7 +23087,7 @@ function requireResourcePath(raw, label = "resourcePath") {
   }
   return raw.trim();
 }
-var CHANGES_SCHEMA3 = {
+var CHANGES_SCHEMA5 = {
   type: "array",
   description: "the proposed permission-grant changes; each entry creates, updates, or deletes one grant (one identity's actions on one resource). List each (resourceType, resourcePath, identityType, identityId) combination at most once.",
   items: {
@@ -21784,7 +23119,7 @@ var CHANGES_SCHEMA3 = {
     required: ["verb", "resourceType", "resourcePath", "identityType", "identityId"]
   }
 };
-var TASK_SCHEMA3 = {
+var TASK_SCHEMA5 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -21799,8 +23134,8 @@ function makeListPermissionGrantsTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        resourceType: CHANGES_SCHEMA3.items.properties.resourceType,
-        resourcePath: CHANGES_SCHEMA3.items.properties.resourcePath
+        resourceType: CHANGES_SCHEMA5.items.properties.resourceType,
+        resourcePath: CHANGES_SCHEMA5.items.properties.resourcePath
       },
       required: ["resourceType", "resourcePath"]
     },
@@ -21830,10 +23165,10 @@ function makeGetPermissionGrantTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        resourceType: CHANGES_SCHEMA3.items.properties.resourceType,
-        resourcePath: CHANGES_SCHEMA3.items.properties.resourcePath,
-        identityType: CHANGES_SCHEMA3.items.properties.identityType,
-        identityId: CHANGES_SCHEMA3.items.properties.identityId
+        resourceType: CHANGES_SCHEMA5.items.properties.resourceType,
+        resourcePath: CHANGES_SCHEMA5.items.properties.resourcePath,
+        identityType: CHANGES_SCHEMA5.items.properties.identityType,
+        identityId: CHANGES_SCHEMA5.items.properties.identityId
       },
       required: ["resourceType", "resourcePath", "identityType", "identityId"]
     },
@@ -21854,7 +23189,7 @@ function makePreviewPermissionChangesTool(deps) {
     description: "Resolve a set of proposed permission-grant creates/updates/deletes into a reviewable plan WITHOUT changing anything on the server. Every verb in this area is always high risk (requiresAgentSignoff is always true); requiresStorageBackup is always false \u2014 a permission grant is a single reversible key-value entry, unlike a schedule task. You MUST pass the returned planHash to apply_permission_changes: the server re-resolves the plan there and refuses with a conflict if anything drifted, including a concurrent, unrelated grant change on the SAME resource (the hash covers every grant on the resource, not just the one you're touching, because the underlying write replaces the whole resource's grant set). A preview can itself be refused if the change would remove YOUR OWN ADMIN grant on the resource \u2014 the server treats that as a plan whose own undo you could not perform, the same reasoning it applies to a schedule-task delete you couldn't roll back. Returns a planHash AND a taskToken; you MUST pass both to apply_permission_changes \u2014 the server writes the audit record from the task narrative embedded in taskToken, the one reviewed here, never from whatever task text apply_permission_changes itself is called with. Served by the StyleBI enterprise module; a community-only deployment 404s on this endpoint.",
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA3, changes: CHANGES_SCHEMA3 },
+      properties: { task: TASK_SCHEMA5, changes: CHANGES_SCHEMA5 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -21873,8 +23208,8 @@ function makeApplyPermissionChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA3,
-        changes: CHANGES_SCHEMA3,
+        task: TASK_SCHEMA5,
+        changes: CHANGES_SCHEMA5,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_permission_changes for this exact plan"
@@ -22041,17 +23376,17 @@ function makeCopyPermissionGrantsTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA3,
-        sourceResourceType: CHANGES_SCHEMA3.items.properties.resourceType,
-        sourceResourcePath: CHANGES_SCHEMA3.items.properties.resourcePath,
+        task: TASK_SCHEMA5,
+        sourceResourceType: CHANGES_SCHEMA5.items.properties.resourceType,
+        sourceResourcePath: CHANGES_SCHEMA5.items.properties.resourcePath,
         targets: {
           type: "array",
           description: "one or more { resourceType, resourcePath } targets whose ENTIRE grant set will be REPLACED to match the source's exactly. A single { resourceType, resourcePath } object is accepted as a one-element-array alias. Every target is resolved into ONE combined plan \u2014 call this tool once for all targets, not once per target.",
           items: {
             type: "object",
             properties: {
-              resourceType: CHANGES_SCHEMA3.items.properties.resourceType,
-              resourcePath: CHANGES_SCHEMA3.items.properties.resourcePath
+              resourceType: CHANGES_SCHEMA5.items.properties.resourceType,
+              resourcePath: CHANGES_SCHEMA5.items.properties.resourcePath
             },
             required: ["resourceType", "resourcePath"]
           }
@@ -22119,7 +23454,7 @@ function makePermissionTools(deps) {
 }
 
 // src/tools/identityTools.ts
-var CHANGES_SCHEMA4 = {
+var CHANGES_SCHEMA6 = {
   type: "array",
   description: 'the proposed identity creates/deletes/updates; each entry names a unitType FIRST \u2014 set it correctly before building spec, since a field that belongs to a different unit type (e.g. parentGroups on unitType="user") is refused loud, not silently dropped. List each (unitType, id) at most once.',
   items: {
@@ -22139,30 +23474,28 @@ var CHANGES_SCHEMA4 = {
       },
       spec: {
         type: "object",
-        description: "required for verb=create/update, forbidden for verb=delete. Shape depends on unitType: user={name,orgId?,password,alias?,locale?,active?,emails?,groups?,roles?}; group={name,orgId?,parentGroups?,memberUsers?,memberGroups?,roles?}; role={name,orgId?,description?,inheritedRoles?,assignedUsers?,assignedGroups?}; organization={id,orgName,locale?}. `groups`/`memberUsers`/`memberGroups`/`assignedUsers`/`assignedGroups` reference EXISTING identities only \u2014 the server filters out any the caller cannot administer rather than failing, so check the preview's warnings, if any, before applying. `theme` is accepted on every unitType. `adminIdentities` is not supported by this tool on any unitType \u2014 grant admin rights over an identity separately after creating it. For verb=update, spec is PARTIAL: an omitted field leaves the identity's current value unchanged, an explicit \"\"/[] clears it, and an explicit null is refused loud (it cannot be distinguished from omitted once sent, so it's rejected rather than silently doing nothing). user/group/role may be renamed via spec.name (the top-level id above still targets the CURRENT name). Three fields are refused loud on update regardless of value: spec.password (user \u2014 password rotation is out of scope for update), spec.orgId (user/group/role \u2014 an identity's organization is fixed by the id you're targeting, not settable via spec), and spec.id (organization \u2014 its own id is fixed by the id argument; only its display name, spec.orgName, is renameable)."
+        description: "required for verb=create/update, forbidden for verb=delete. Shape depends on unitType: user={name,orgId?,password,alias?,locale?,active?,emails?,groups?,roles?}; group={name,orgId?,parentGroups?,memberUsers?,memberGroups?,roles?}; role={name,orgId?,description?,inheritedRoles?,assignedUsers?,assignedGroups?,defaultRole?,sysAdmin?}; organization={id,orgName,locale?,properties?}. `groups`/`memberUsers`/`memberGroups`/`assignedUsers`/`assignedGroups` reference EXISTING identities only \u2014 the server filters out any the caller cannot administer rather than failing, so check the preview's warnings, if any, before applying. `theme` is accepted on every unitType. `adminIdentities` is not supported by this tool on any unitType \u2014 grant admin rights over an identity separately after creating it. `role.defaultRole` (boolean) marks the role as auto-assigned to every newly-created user. `role.sysAdmin` (boolean) designates the role as the System Administrator role \u2014 security-sensitive, same class as Providers' LDAP sysAdminRoles field; gated by this area's own unconditional signoff+backup, same as every other mutation here, no extra confirmation. `organization.properties` is an array of {name,value} (or a plain name->value map) \u2014 these are NOT inert per-organization metadata, they are live overrides into the SAME shared global server-property namespace the Properties area's own tools manage, just scoped to this organization; setting one can change real product behavior for everyone in that organization. Sending properties on update replaces every entry EXCEPT the 4 named quota keys (max.row.count/max.col.count/max.cell.size/max.user.count), which are preserved at their current value unless explicitly named in the list \u2014 omit the whole properties field to leave every property untouched. For verb=update, spec is PARTIAL: an omitted field leaves the identity's current value unchanged, an explicit \"\"/[] clears it, and an explicit null is refused loud (it cannot be distinguished from omitted once sent, so it's rejected rather than silently doing nothing). user/group/role may be renamed via spec.name (the top-level id above still targets the CURRENT name). Three fields are refused loud on update regardless of value: spec.password (user \u2014 password rotation is out of scope for update), spec.orgId (user/group/role \u2014 an identity's organization is fixed by the id you're targeting, not settable via spec), and spec.id (organization \u2014 its own id is fixed by the id argument; only its display name, spec.orgName, is renameable)."
       }
     },
     required: ["verb", "unitType"]
   }
 };
-var TASK_SCHEMA4 = {
+var TASK_SCHEMA6 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
 function makeListUsersTool(deps) {
   return {
     name: "list_identity_users",
-    description: "List security users, optionally filtered by organization id. Served by the StyleBI enterprise module; a community-only deployment 404s on this endpoint.",
+    description: "List security users in the caller's CURRENT organization. To list a DIFFERENT organization's users, call switch_organization first \u2014 this tool takes no org argument of its own. Served by the StyleBI enterprise module; a community-only deployment 404s on this endpoint.",
     inputSchema: {
       type: "object",
-      properties: {
-        orgId: { type: "string", description: "optional; omit to list every organization's users" }
-      }
+      properties: {}
     },
     call: async (args) => {
       await assertStyleBIRouting(deps.tokenStore);
-      const query = typeof args?.orgId === "string" && args.orgId.trim() !== "" ? `?orgId=${encodeURIComponent(args.orgId.trim())}` : "";
-      return deps.wizClient.get(`/v1/admin/identities/users${query}`);
+      requireNoOrgScopeParam(args?.orgId, "orgId", "list_identity_users");
+      return deps.wizClient.get("/v1/admin/identities/users");
     }
   };
 }
@@ -22185,17 +23518,15 @@ function makeGetUserTool(deps) {
 function makeListGroupsTool(deps) {
   return {
     name: "list_identity_groups",
-    description: "List security groups, optionally filtered by organization id. Served by the StyleBI enterprise module; a community-only deployment 404s on this endpoint.",
+    description: "List security groups in the caller's CURRENT organization. To list a DIFFERENT organization's groups, call switch_organization first \u2014 this tool takes no org argument of its own. Served by the StyleBI enterprise module; a community-only deployment 404s on this endpoint.",
     inputSchema: {
       type: "object",
-      properties: {
-        orgId: { type: "string", description: "optional; omit to list every organization's groups" }
-      }
+      properties: {}
     },
     call: async (args) => {
       await assertStyleBIRouting(deps.tokenStore);
-      const query = typeof args?.orgId === "string" && args.orgId.trim() !== "" ? `?orgId=${encodeURIComponent(args.orgId.trim())}` : "";
-      return deps.wizClient.get(`/v1/admin/identities/groups${query}`);
+      requireNoOrgScopeParam(args?.orgId, "orgId", "list_identity_groups");
+      return deps.wizClient.get("/v1/admin/identities/groups");
     }
   };
 }
@@ -22218,17 +23549,15 @@ function makeGetGroupTool(deps) {
 function makeListRolesTool(deps) {
   return {
     name: "list_identity_roles",
-    description: "List security roles, optionally filtered by organization id. Served by the StyleBI enterprise module; a community-only deployment 404s on this endpoint.",
+    description: "List security roles in the caller's CURRENT organization. To list a DIFFERENT organization's roles, call switch_organization first \u2014 this tool takes no org argument of its own. Served by the StyleBI enterprise module; a community-only deployment 404s on this endpoint.",
     inputSchema: {
       type: "object",
-      properties: {
-        orgId: { type: "string", description: "optional; omit to list every organization's roles" }
-      }
+      properties: {}
     },
     call: async (args) => {
       await assertStyleBIRouting(deps.tokenStore);
-      const query = typeof args?.orgId === "string" && args.orgId.trim() !== "" ? `?orgId=${encodeURIComponent(args.orgId.trim())}` : "";
-      return deps.wizClient.get(`/v1/admin/identities/roles${query}`);
+      requireNoOrgScopeParam(args?.orgId, "orgId", "list_identity_roles");
+      return deps.wizClient.get("/v1/admin/identities/roles");
     }
   };
 }
@@ -22283,7 +23612,7 @@ function makePreviewIdentityChangesTool(deps) {
     description: "Resolve a set of proposed identity creates/deletes/updates (any mix of user/group/role/organization) into a reviewable plan WITHOUT changing anything on the server. Every verb in this area is always high risk (requiresAgentSignoff is always true) and always requires a Tier-2 storage backup (requiresStorageBackup is always true) \u2014 even a create, because it can mutate a second record as a side effect (adding the new identity to its organization's member list, or reassigning existing members to a new group/role). You MUST pass the returned planHash to apply_identity_changes. IMPORTANT things to know before previewing a delete: (1) deleting a user has only a PARTIAL undo \u2014 a rolled-back delete recreates the account with a freshly generated password disclosed once in the apply result, not the original password, which the server never exposes; (2) deleting an organization has NO undo at all \u2014 it is declared non-compensable, gated behind the mandatory backup, and the default/self organization cannot be deleted through this tool at all (refused at preview time); (3) deleting a user or group may affect schedule tasks (ownership transfer or deletion) \u2014 this is surfaced as an advisory in the apply result, not blocked here, so relay it to the human as part of plan review. Returns a planHash and a taskToken. You MUST pass both planHash and taskToken to apply_identity_changes: the server re-resolves the plan and refuses with a conflict if anything drifted, and it writes the audit record from the task narrative embedded in taskToken -- the one reviewed here -- never from whatever task text apply_identity_changes itself is called with. Served by the StyleBI enterprise module; a community-only deployment 404s on this endpoint.",
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA4, changes: CHANGES_SCHEMA4 },
+      properties: { task: TASK_SCHEMA6, changes: CHANGES_SCHEMA6 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -22302,8 +23631,8 @@ function makeApplyIdentityChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA4,
-        changes: CHANGES_SCHEMA4,
+        task: TASK_SCHEMA6,
+        changes: CHANGES_SCHEMA6,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_identity_changes for this exact plan"
@@ -22374,8 +23703,156 @@ function makeIdentityTools(deps) {
   ];
 }
 
+// src/tools/organizationTools.ts
+function requireOptionalString(value, field) {
+  if (value === void 0 || value === null) return void 0;
+  if (typeof value !== "string") {
+    throw new Error(`${field} must be a string, got ${typeof value}`);
+  }
+  const trimmed = value.trim();
+  return trimmed === "" ? void 0 : trimmed;
+}
+async function runSwitchOrganization(args, deps) {
+  await assertStyleBIRouting(deps.tokenStore);
+  const orgId = requireOptionalString(args.orgId, "orgId");
+  const orgName = requireOptionalString(args.orgName, "orgName");
+  if (orgId === void 0 && orgName === void 0) {
+    throw new Error("orgId or orgName is required");
+  }
+  const active = await deps.tokenStore.getActive();
+  if (!active) {
+    throw new Error("Not logged in to any StyleBI deployment. Run login_start to log in.");
+  }
+  const body = {};
+  if (orgId !== void 0) body.orgId = orgId;
+  if (orgName !== void 0) body.orgName = orgName;
+  const resp = await deps.wizClient.post(
+    "/v1/admin/organizations/switch",
+    body
+  );
+  if (typeof resp.accessToken !== "string" || resp.accessToken.trim() === "") {
+    throw new Error(
+      "switch_organization response is missing a valid accessToken. This StyleBI deployment likely predates the organization-switch token-reissuance fix -- check the server version rather than retrying. Refusing before persisting credentials to avoid corrupting the stored login."
+    );
+  }
+  if (typeof resp.expiresAt !== "number") {
+    throw new Error(
+      "switch_organization response is missing a valid expiresAt. This StyleBI deployment likely predates the organization-switch token-reissuance fix -- check the server version rather than retrying. Refusing before persisting credentials to avoid corrupting the stored login."
+    );
+  }
+  await deps.tokenStore.save(active.deployment, {
+    ...active.creds,
+    accessToken: resp.accessToken,
+    expiresAt: resp.expiresAt,
+    user: { ...active.creds.user, organizationId: resp.orgId }
+  });
+  return {
+    orgId: resp.orgId,
+    orgName: resp.orgName,
+    summary: `Switched to organization "${resp.orgName}" (${resp.orgId}). This stays in effect for every subsequent admin-chat call \u2014 this session and future ones \u2014 until switch_organization is called again or you log in again.`
+  };
+}
+async function runGetCurrentOrganization(deps) {
+  await assertStyleBIRouting(deps.tokenStore);
+  return deps.wizClient.get("/v1/admin/organizations/current");
+}
+function makeOrganizationTools(deps) {
+  return [
+    {
+      name: "switch_organization",
+      description: "Switch the organization this admin-chat login operates in, by orgId or orgName (exactly one required, or both if they agree \u2014 use list_identity_organizations to look one up from the other). Enterprise-only: community deployments have no organization concept and this 404s there. The switch is PERSISTENT \u2014 it replaces the locally stored access token, so it stays in effect for every subsequent admin-chat tool call, this session and any future one reusing the same login, until switch_organization is called again or you log in again.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          orgId: { type: "string", description: "the target organization's id (not its display name)" },
+          orgName: { type: "string", description: "the target organization's display name (not its id)" }
+        }
+      },
+      call: (args) => runSwitchOrganization(args ?? {}, deps)
+    },
+    {
+      name: "get_current_organization",
+      description: "Read the organization currently active for this admin-chat login. Read-only \u2014 does not change anything or call switch_organization implicitly. Enterprise-only, matching switch_organization.",
+      inputSchema: { type: "object", properties: {} },
+      call: () => runGetCurrentOrganization(deps)
+    }
+  ];
+}
+
+// src/tools/deploymentState.ts
+async function isEnterpriseLicensed(deps) {
+  try {
+    await deps.wizClient.get("/v1/admin/licensing/keys");
+    return true;
+  } catch (err) {
+    if (err?.code === "HTTP_404") {
+      return false;
+    }
+    throw err;
+  }
+}
+async function isMultiTenant(deps) {
+  const response = await deps.wizClient.get(
+    "/v1/admin/providers/multi-tenant"
+  );
+  return response?.multiTenant === true;
+}
+
 // src/tools/providerTools.ts
-var CHANGES_SCHEMA5 = {
+var DATABASE_SPEC_PARAMETERIZED_FIELDS = [
+  "userQuery",
+  "groupUsersQuery",
+  "userRolesQuery",
+  "userEmailsQuery"
+];
+var DATABASE_SPEC_MULTI_TENANT_ONLY_FIELDS = [
+  "organizationListQuery",
+  "organizationMembersQuery",
+  "organizationNameQuery",
+  "orgAdminRoles"
+];
+function countPlaceholders(sql) {
+  return (sql.match(/\?/g) ?? []).length;
+}
+function hasValue(raw) {
+  if (typeof raw === "string") {
+    return raw.trim() !== "";
+  }
+  return Array.isArray(raw) ? raw.length > 0 : raw !== void 0 && raw !== null;
+}
+async function requireDatabaseSpecMultiTenantShapes(deps, changes) {
+  const entriesWithDatabaseSpec = changes.map((change, index) => ({ change, index })).filter(({ change }) => change.databaseSpec !== void 0);
+  if (entriesWithDatabaseSpec.length === 0) {
+    return;
+  }
+  const multiTenant = await isMultiTenant(deps);
+  const expected = multiTenant ? 2 : 1;
+  for (const { change, index } of entriesWithDatabaseSpec) {
+    const spec = change.databaseSpec;
+    if (!multiTenant) {
+      for (const field of DATABASE_SPEC_MULTI_TENANT_ONLY_FIELDS) {
+        if (hasValue(spec[field])) {
+          throw new Error(
+            `changes[${index}].databaseSpec.${field}: not supported \u2014 this deployment is NOT multi-tenant (per get_multi_tenant_status), and the real Enterprise Manager Database provider dialog itself only renders this field in multi-tenant mode (database-provider-view.component.ts's own requiresMultiTenant flag). Remove this field; it has no effect on a non-multi-tenant deployment and there is nowhere in the real UI it could even be set here.`
+          );
+        }
+      }
+    }
+    for (const field of DATABASE_SPEC_PARAMETERIZED_FIELDS) {
+      const raw = spec[field];
+      if (typeof raw !== "string" || raw.trim() === "") {
+        continue;
+      }
+      const actual = countPlaceholders(raw);
+      if (actual !== expected) {
+        throw new Error(
+          `changes[${index}].databaseSpec.${field}: this deployment is currently ${multiTenant ? "multi-tenant" : "NOT multi-tenant"} (per get_multi_tenant_status), which requires exactly ${expected} "?" placeholder${expected === 1 ? "" : "s"} in this field \u2014 found ${actual}. ` + (multiTenant ? 'Multi-tenant order is organizationid FIRST, then the identity value, e.g. "...WHERE organizationid = ? AND username = ?".' : 'Non-multi-tenant takes only the identity value, e.g. "...WHERE username = ?".') + " This is a syntactic placeholder-count check only (this plugin cannot validate SQL semantics) \u2014 getting the count right does not guarantee the query is otherwise correct."
+        );
+      }
+    }
+  }
+}
+var CHANGES_SCHEMA7 = {
   type: "array",
   description: `the proposed provider creates/deletes/duplicates/updates; each entry names a chain FIRST ("authentication" or "authorization", no abbreviations \u2014 "auth" is refused loud, not guessed, since it is ambiguous between the two). Provider chains are DEPLOYMENT-WIDE, not org-scoped \u2014 there is no orgId argument here, and the resolved plan's orgId field will be null: that is not a bug or a missing value, it means the change applies to the whole deployment, not any single organization. List each (chain, name) at most once.`,
   items: {
@@ -22395,11 +23872,15 @@ var CHANGES_SCHEMA5 = {
       },
       providerType: {
         type: "string",
-        description: `required for verb=create, forbidden for verb=delete/duplicate/update (a duplicate always keeps the source provider's own type, matching the real EM "Duplicate" action; an update cannot change a provider's type at all \u2014 delete and create a new provider instead if the type itself needs to change). "FILE" or "LDAP" \u2014 chain="authorization" accepts only "FILE" (LDAP is authentication-chain-only). "DATABASE"/"CUSTOM" are refused for either chain in this area's first cut (license-gating gap and unbounded class-loading/secrets surface, respectively) for verb=create; a DATABASE/CUSTOM provider CAN still be duplicated \u2014 its apply step re-instantiates the source's class (CUSTOM) or re-runs a live connection test (DATABASE), the same risk create's exclusion guards against, but only an Enterprise-licensed deployment can already have such a provider to duplicate, and the server refuses the attempt loud, before any instantiation, on any other deployment.`
+        description: `required for verb=create, forbidden for verb=delete/duplicate/update (a duplicate always keeps the source provider's own type, matching the real EM "Duplicate" action; an update cannot change a provider's type at all \u2014 delete and create a new provider instead if the type itself needs to change). "FILE", "LDAP", or "DATABASE" \u2014 chain="authorization" accepts only "FILE" (LDAP/DATABASE are authentication-chain-only). "DATABASE" REQUIRES an Enterprise-licensed deployment \u2014 refused loud, naming the missing license, at both preview and apply time otherwise (the real license gate this area wraps, \`AuthenticationProviderService.checkProviderTypeLicensed\`, not a separate check this plugin invents) \u2014 editing an ALREADY-EXISTING DATABASE provider's other fields via verb=update needs no license at all, only genuinely introducing a new one does. "CUSTOM" is refused for either chain unconditionally, independent of licensing \u2014 it loads a caller-named class from the server's classpath and feeds it a schema-free configuration blob, an unbounded secrets/injection surface this area does not attempt to reason about safely. A DATABASE/CUSTOM provider CAN still be duplicated regardless of this area's own create-side restrictions \u2014 its apply step re-instantiates the source's class (CUSTOM) or re-runs a live connection test (DATABASE), the same risk create's exclusion guards against, but only an Enterprise-licensed deployment can already have such a provider to duplicate, and the server refuses the attempt loud, before any instantiation, on any other deployment.`
       },
       spec: {
         type: "object",
-        description: `for verb=create: required for providerType="LDAP", forbidden (or must be empty) for providerType="FILE" (a FILE provider has no configuration beyond its name). Forbidden for verb=delete/duplicate. For verb=update: required, and PARTIAL \u2014 an object with at least one LDAP field to change; this is NOT a full provider passthrough, any field you omit is preserved UNCHANGED from the current provider (the server merges your partial spec onto the provider's live, currently-stored configuration). LDAP shape (same field set for both create and update): {ldapServer:"ACTIVE_DIRECTORY"|"GENERIC", protocol, hostName, hostPort, rootDN, useCredential?, adminID?, password?, secretId?, userFilter?, userBase?, userAttr?, mailAttr?, groupFilter?, groupBase?, groupAttr?, roleFilter?, roleBase?, roleAttr?, userRoleFilter?, roleRoleFilter?, groupRoleFilter?, startTls?, searchTree?, sysAdminRoles?}. useCredential:true REQUIRES secretId and forbids adminID/password; useCredential:false (the default) REQUIRES BOTH adminID and password and forbids secretId \u2014 sending the wrong combination for the resolved mode is a field-named error, never a silent drop of whichever field doesn't apply. For verb=update specifically, this credential-mode check is only enforced fully once merged with the CURRENT provider's stored mode (server-side, since this plugin layer has no live view of what mode the provider is currently in) \u2014 but sending secretId together with adminID/password in the SAME update is refused loud client-side too, since that combination can never be valid regardless of what it merges onto.`
+        description: `LDAP configuration \u2014 for verb=create: required for providerType="LDAP", forbidden for providerType="FILE"/"DATABASE" (use databaseSpec for DATABASE). Forbidden for verb=delete/duplicate. For verb=update: required WHEN THE TARGET PROVIDER IS LDAP (forbidden, use databaseSpec instead, when it is DATABASE) \u2014 call get_auth_provider/get_authz_provider FIRST to confirm which, the same "load before you edit" workflow any real edit dialog follows; this plugin layer cannot see the target's live type at validation time and so cannot auto-detect which of spec/databaseSpec applies \u2014 sending the wrong one for the target's actual type is refused loud, naming the mismatch, by the server (which does know the live type), never silently guessed. PARTIAL on update \u2014 an object with at least one LDAP field to change; this is NOT a full provider passthrough, any field you omit is preserved UNCHANGED from the current provider (the server merges your partial spec onto the provider's live, currently-stored configuration). LDAP shape (same field set for both create and update): {ldapServer:"ACTIVE_DIRECTORY"|"GENERIC", protocol, hostName, hostPort, rootDN, useCredential?, adminID?, password?, secretId?, userFilter?, userBase?, userAttr?, mailAttr?, groupFilter?, groupBase?, groupAttr?, roleFilter?, roleBase?, roleAttr?, userRoleFilter?, roleRoleFilter?, groupRoleFilter?, startTls?, searchTree?, sysAdminRoles?}. useCredential:true REQUIRES secretId and forbids adminID/password; useCredential:false (the default) REQUIRES BOTH adminID and password and forbids secretId \u2014 sending the wrong combination for the resolved mode is a field-named error, never a silent drop of whichever field doesn't apply. For verb=update specifically, this credential-mode check is only enforced fully once merged with the CURRENT provider's stored mode (server-side, since this plugin layer has no live view of what mode the provider is currently in) \u2014 but sending secretId together with adminID/password in the SAME update is refused loud client-side too, since that combination can never be valid regardless of what it merges onto.`
+      },
+      databaseSpec: {
+        type: "object",
+        description: 'BEFORE constructing this field at all, call get_multi_tenant_status() to learn whether this deployment is multi-tenant, THEN write userQuery/groupUsersQuery/userRolesQuery/userEmailsQuery/userListQuery/groupListQuery/roleListQuery/userRoleListQuery in the matching shape from the very first draft \u2014 do not write a plausible-looking query and let this tool\'s own placeholder-count check (below) catch it after the fact; that check exists as a safety net for the 4 parameterized fields only, not as the primary way to get this right, and it cannot check the other 4 fields\' SELECT-column shape at all. DATABASE configuration (bug 76716) \u2014 a separate, strongly-typed field from spec, never the same field: for verb=create, required for providerType="DATABASE", forbidden for providerType="FILE"/"LDAP" (use spec for LDAP). Forbidden for verb=delete/duplicate. For verb=update: required WHEN THE TARGET PROVIDER IS DATABASE (forbidden, use spec instead, when it is LDAP) \u2014 same "call get_auth_provider/get_authz_provider first, then send the ONE field matching what it returns" discipline spec\'s own description documents; sending both spec and databaseSpec on the same update entry is refused loud client-side (ambiguous), sending the one that doesn\'t match the target\'s real type is refused loud by the server. PARTIAL on update, same semantics as spec: any field you omit is preserved UNCHANGED from the current provider. DATABASE shape (same field set for both create and update, mirrors `DatabaseAuthenticationProviderModel` field-for-field): {driver, url, hashAlgorithm, requiresLogin? (default true \u2014 whether a login is required to query the database AT ALL; explicit false SKIPS the useCredential/secretId/user/password requirement below entirely, matching the real EM dialog which neither renders nor requires any credential field once this is unchecked), useCredential?, secretId?, user?, password?, userQuery?, userListQuery?, groupListQuery?, groupUsersQuery?, roleListQuery?, userRolesQuery?, userRoleListQuery?, organizationListQuery?, organizationNameQuery?, organizationMembersQuery?, organizationRolesQuery?, userEmailsQuery?, appendSalt?, sysAdminRoles?, orgAdminRoles?}. Note the credential-by-value field is named `user`, NOT `adminID` (LDAP\'s own spelling) \u2014 sending `adminID` here is refused loud as an unrecognized DATABASE field, never silently accepted under the wrong name. `organizationListQuery`/`organizationMembersQuery`/`organizationNameQuery`/`orgAdminRoles` are MULTI-TENANT ONLY \u2014 confirmed directly against the real EM Database provider dialog (`database-provider-view.component.ts`\'s own `requiresMultiTenant` flag/`.html`\'s `@if (isMultiTenant)` wrapper around `orgAdminRoles`): that form renders these 4 fields ONLY in multi-tenant mode, so this tool refuses them loud, naming the field, if set on a non-multi-tenant deployment (call get_multi_tenant_status() first, same as for the query-field shapes below) \u2014 none of the 4 is ever required even when multi-tenant. `organizationRolesQuery` is NOT one of these 4 despite the name \u2014 the real EM dialog has no control for it in EITHER mode (a standing EM gap this tool does not attempt to restrict further), so it is accepted in both modes. useCredential:true REQUIRES secretId and forbids user/password; useCredential:false (the default) REQUIRES BOTH user and password and forbids secretId \u2014 same field-named-error-on-wrong-combination discipline spec\'s own useCredential documents. The query fields are free-text SQL this plugin cannot validate for semantic correctness (only field-shape) \u2014 a wrong query string is accepted here and only surfaces as an authentication failure later. THIS TOOL ITSELF CHECKS ONE PART OF THIS: it calls get_multi_tenant_status() internally (never inferred from list_identity_organizations\' org count, which is unreliable \u2014 a multi-tenant-enabled deployment can have exactly one org configured right now) and validates the `?` COUNT in userQuery/groupUsersQuery/userRolesQuery/userEmailsQuery against it, refusing loud, naming the field and the expected vs. actual count, before anything is sent to the server \u2014 but this is a purely syntactic placeholder-count check, not full SQL validation, and it CANNOT check userListQuery/groupListQuery/roleListQuery/userRoleListQuery\'s expected SELECT-column shape at all (parsing arbitrary SQL for projected columns is not reliable across dialects) \u2014 get those right by hand: the SQL shape genuinely differs by mode, silently (wrong param bound to wrong placeholder / wrong column read as the org id), not just by convention. `userQuery`/`groupUsersQuery`/`userRolesQuery`/`userEmailsQuery` take ONE positional `?` (the username/group/user) when NOT multi-tenant, but TWO positional `?` IN ORDER \u2014 organizationid FIRST, then the username/group/user \u2014 when multi-tenant (e.g. non-multi-tenant: "...WHERE username = ?"; multi-tenant: "...WHERE organizationid = ? AND username = ?"). `userListQuery`/`groupListQuery`/`roleListQuery` take no parameters but must SELECT an extra organizationid column, positioned immediately after the identity column, when multi-tenant (e.g. non-multi-tenant: "SELECT username FROM ..."; multi-tenant: "SELECT username, organizationid FROM ...") \u2014 columns are read positionally, so a reordered or missing organizationid column is silently misread, never a clean error. `userRoleListQuery` (multi-tenant) must SELECT exactly (username, role, organizationid) in that order. `organizationListQuery`/`organizationNameQuery`/`organizationRolesQuery`/`organizationMembersQuery` are unaffected by this distinction (organizationNameQuery/organizationRolesQuery/organizationMembersQuery each take their own single `?`, always). See the Providers section of this plugin\'s own CLAUDE.md for the full per-field table (verified directly against `AuthenticationDAO`\'s query-binding source, not guessed).'
       },
       newName: {
         type: "string",
@@ -22409,7 +23890,7 @@ var CHANGES_SCHEMA5 = {
     required: ["verb", "chain", "name"]
   }
 };
-var TASK_SCHEMA5 = {
+var TASK_SCHEMA7 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -22564,17 +24045,19 @@ function makeClearProviderCacheTool(deps) {
 function makePreviewProviderChangesTool(deps) {
   return {
     name: "preview_provider_changes",
-    description: "Resolve a set of proposed provider creates/deletes/duplicates/updates (either or both chains) into a reviewable plan WITHOUT changing anything on the server. `duplicate` (aliases \"copy\"/\"clone\") copies an EXISTING provider under a new, auto-generated or explicit `newName` \u2014 unlike create, it needs no `providerType`/`spec` (the copy keeps the source's own configuration verbatim) and, unlike create's own DATABASE/CUSTOM exclusion, works on ANY existing provider type \u2014 its apply step does re-instantiate a CUSTOM provider's class or re-run a live DATABASE connection test just as create would, but that is only reachable on an Enterprise-licensed deployment (the same license check create's exclusion exists for refuses it loud otherwise). `update` (aliases \"modify\"/\"edit\") changes one or more fields \u2014 an LDAP bind password, a hostname, a port \u2014 on an EXISTING provider WITHOUT the delete+create reorder problem: the provider is edited IN PLACE, at its current chain position, never moved. It takes a PARTIAL `spec`; any field you omit is preserved unchanged from the provider's current, live configuration. `update` cannot change `providerType` or rename the provider (both are refused loud) \u2014 delete+create is still the only path for those. Every verb in this area is always high risk (requiresAgentSignoff is always true) and always requires a Tier-2 storage backup (requiresStorageBackup is always true). Returns each provider's status plus requiresStorageBackup, requiresAgentSignoff, a planHash, and a taskToken. You MUST pass both planHash and taskToken to apply_provider_changes: the server re-resolves the plan and refuses with a conflict if anything drifted, and it writes the audit record from the task narrative embedded in taskToken -- the one reviewed here -- never from whatever task text apply_provider_changes itself is called with. READ THIS BEFORE PREVIEWING A DELETE OR AN UPDATE ON THE AUTHENTICATION CHAIN: deleting, OR EDITING, the provider that currently recognizes THIS CALLING SESSION's own role as system-administrator is a HARD, UNRECOVERABLE-THROUGH-ADMIN-CHAT LOCKOUT \u2014 every admin-chat tool in every area is gated by the identical mechanism a wrong delete OR a wrong update can break, so either one locks out not just this area but the entire plugin, with no remedy short of direct EM/database access. The server runs the same two independent preflight checks before accepting either kind of plan (a deployment-wide check and a caller-specific check, simulating the post-change chain for delete's removal or update's field edit) and refuses one that would self-lock the calling session or leave the deployment with no system-administrator authentication provider at all \u2014 do not attempt to route around a refusal, explain the risk to the user instead. UNLIKE EVERY OTHER VERB, previewing an LDAP `update` on the authentication chain performs a LIVE connection test against the PROPOSED configuration (the self-lockout preflight above has to actually construct the edited provider to check it) \u2014 `create`'s own preview only validates field shape and defers its live bind to apply time. This means a transient LDAP outage or slow network can cause preview_provider_changes itself to fail or hang for an `update` entry, even when the change is otherwise entirely valid \u2014 explain this to the user as a possible, retryable cause of a preview failure, not necessarily a sign the proposed change itself is wrong. The authorization chain has a narrower floor for delete: a delete that would leave zero authorization providers is refused (an update never changes the count of providers in a chain, so this floor does not apply to update). Provider chains are deployment-wide configuration, not org-scoped \u2014 see the changes schema for the orgId-is-null caveat. Unlike schedule tasks/permissions/identities, this area is NOT enterprise-gated \u2014 this tool works on a community-only deployment.",
+    description: "Resolve a set of proposed provider creates/deletes/duplicates/updates (either or both chains) into a reviewable plan WITHOUT changing anything on the server. `duplicate` (aliases \"copy\"/\"clone\") copies an EXISTING provider under a new, auto-generated or explicit `newName` \u2014 unlike create, it needs no `providerType`/`spec`/`databaseSpec` (the copy keeps the source's own configuration verbatim) and, unlike create's own CUSTOM exclusion, works on ANY existing provider type \u2014 its apply step does re-instantiate a CUSTOM provider's class or re-run a live DATABASE connection test just as create would, but the DATABASE case is a normal, licensed operation on an Enterprise-licensed deployment (the same license gate `providerType`'s own description names refuses it loud on any other deployment; CUSTOM has no such gate at all and stays excluded from every verb this area can use to introduce a NEW instance of one, create included). `update` (aliases \"modify\"/\"edit\") changes one or more fields \u2014 an LDAP bind password or DATABASE connection string, a hostname, a port \u2014 on an EXISTING provider WITHOUT the delete+create reorder problem: the provider is edited IN PLACE, at its current chain position, never moved. It takes a PARTIAL `spec` (LDAP) or `databaseSpec` (DATABASE) \u2014 whichever matches the target provider's real type, see their own descriptions; any field you omit is preserved unchanged from the provider's current, live configuration. `update` cannot change `providerType` or rename the provider (both are refused loud) \u2014 delete+create is still the only path for those. Every verb in this area is always high risk (requiresAgentSignoff is always true) and always requires a Tier-2 storage backup (requiresStorageBackup is always true). Returns each provider's status plus requiresStorageBackup, requiresAgentSignoff, a planHash, and a taskToken. You MUST pass both planHash and taskToken to apply_provider_changes: the server re-resolves the plan and refuses with a conflict if anything drifted, and it writes the audit record from the task narrative embedded in taskToken -- the one reviewed here -- never from whatever task text apply_provider_changes itself is called with. READ THIS BEFORE PREVIEWING A DELETE OR AN UPDATE ON THE AUTHENTICATION CHAIN: deleting, OR EDITING, the provider that currently recognizes THIS CALLING SESSION's own role as system-administrator is a HARD, UNRECOVERABLE-THROUGH-ADMIN-CHAT LOCKOUT \u2014 every admin-chat tool in every area is gated by the identical mechanism a wrong delete OR a wrong update can break, so either one locks out not just this area but the entire plugin, with no remedy short of direct EM/database access. The server runs the same two independent preflight checks before accepting either kind of plan (a deployment-wide check and a caller-specific check, simulating the post-change chain for delete's removal or update's field edit) and refuses one that would self-lock the calling session or leave the deployment with no system-administrator authentication provider at all \u2014 do not attempt to route around a refusal, explain the risk to the user instead. UNLIKE EVERY OTHER VERB, previewing an LDAP OR DATABASE `update` on the authentication chain performs a LIVE connection test against the PROPOSED configuration \u2014 an LDAP bind, or a real JDBC connection for DATABASE (bug 76716) \u2014 (the self-lockout preflight above has to actually construct the edited provider to check it) \u2014 `create`'s own preview only validates field shape and defers its live bind/connection test to apply time. This means a transient LDAP/database outage or slow network can cause preview_provider_changes itself to fail or hang for an `update` entry, even when the change is otherwise entirely valid \u2014 explain this to the user as a possible, retryable cause of a preview failure, not necessarily a sign the proposed change itself is wrong. The authorization chain has a narrower floor for delete: a delete that would leave zero authorization providers is refused (an update never changes the count of providers in a chain, so this floor does not apply to update). Provider chains are deployment-wide configuration, not org-scoped \u2014 see the changes schema for the orgId-is-null caveat. Unlike schedule tasks/permissions/identities, this area is NOT enterprise-gated \u2014 this tool works on a community-only deployment.",
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA5, changes: CHANGES_SCHEMA5 },
+      properties: { task: TASK_SCHEMA7, changes: CHANGES_SCHEMA7 },
       required: ["task", "changes"]
     },
     call: async (args) => {
       await assertStyleBIRouting(deps.tokenStore);
+      const changes = normalizeProviderChanges(args?.changes);
+      await requireDatabaseSpecMultiTenantShapes(deps, changes);
       return deps.wizClient.post("/v1/admin/providers/preview", {
         task: requireTask(args?.task),
-        changes: normalizeProviderChanges(args?.changes)
+        changes
       });
     }
   };
@@ -22586,8 +24069,8 @@ function makeApplyProviderChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA5,
-        changes: CHANGES_SCHEMA5,
+        task: TASK_SCHEMA7,
+        changes: CHANGES_SCHEMA7,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_provider_changes for this exact plan"
@@ -22615,9 +24098,11 @@ function makeApplyProviderChangesTool(deps) {
           "taskToken: required \u2014 the token returned by preview_provider_changes for this plan. Without it the server cannot verify which reviewed task narrative to audit. Call preview_provider_changes first. If preview_provider_changes's response contained no taskToken at all, this StyleBI deployment predates the pinned-audit contract and must be upgraded \u2014 do not retry."
         );
       }
+      const changes = normalizeProviderChanges(args.changes);
+      await requireDatabaseSpecMultiTenantShapes(deps, changes);
       const body = {
         task: requireTask(args.task),
-        changes: normalizeProviderChanges(args.changes),
+        changes,
         planHash: args.planHash.trim(),
         taskToken: args.taskToken.trim()
       };
@@ -22643,6 +24128,17 @@ function makeApplyProviderChangesTool(deps) {
     }
   };
 }
+function makeGetMultiTenantStatusTool(deps) {
+  return {
+    name: "get_multi_tenant_status",
+    description: "Bug 76716 follow-up: returns whether this StyleBI deployment is configured as multi-tenant \u2014 `{multiTenant: boolean}`, read directly from `inetsoft.sree.internal.SUtil.isMultiTenant()` server-side via a dedicated endpoint (not the generic property `security.users.multiTenant` through `get_property` \u2014 that path's own \"uncatalogued and never explicitly set\" response is genuinely indistinguishable from a misspelled property name, so this tool avoids that ambiguity entirely by calling the real method directly). CALL THIS FIRST, before drafting ANY `databaseSpec` query field (`userQuery`/`groupUsersQuery`/`userRolesQuery`/`userEmailsQuery`/`userListQuery`/`groupListQuery`/`roleListQuery`/`userRoleListQuery`) for a `create` or `update` on a DATABASE provider \u2014 their expected SQL shape (parameter count/order, or SELECT column shape) genuinely differs by this flag, silently. `preview_provider_changes`/`apply_provider_changes` also call this internally as a safety-net check on the 4 parameterized fields' own `?` count, but that is a reactive check after the fact, not a substitute for knowing the answer before writing the query. No arguments; not org-scoped (multi-tenant is a whole-deployment setting, not one that varies per organization). Unlike schedule tasks/permissions/identities, this tool is NOT enterprise-gated \u2014 it works on a community-only deployment too (it will simply always report `false` there, since multi-tenant is itself an Enterprise-only capability).",
+    inputSchema: { type: "object", properties: {} },
+    call: async () => {
+      await assertStyleBIRouting(deps.tokenStore);
+      return { multiTenant: await isMultiTenant(deps) };
+    }
+  };
+}
 function makeProviderTools(deps) {
   return [
     makeListAuthProvidersTool(deps),
@@ -22652,6 +24148,7 @@ function makeProviderTools(deps) {
     makeTestAuthProviderConnectionTool(deps),
     makeListAuthProviderDirectoryEntriesTool(deps),
     makeClearProviderCacheTool(deps),
+    makeGetMultiTenantStatusTool(deps),
     makePreviewProviderChangesTool(deps),
     makeApplyProviderChangesTool(deps)
   ];
@@ -22701,7 +24198,7 @@ async function attachResolvedNames(deps, changes) {
     return { ...rest, name };
   }));
 }
-var CHANGES_SCHEMA6 = {
+var CHANGES_SCHEMA8 = {
   type: "array",
   description: 'the proposed data source updates/deletes/folder-creates; each update/delete entry identifies a data source by id and/or name (at least one required); a create entry (verb="create") identifies a FOLDER by folderPath instead and uses no id/name/spec/force/confirmRename. List each (id or name, or folderPath) at most once. To move N data sources into the same folder in one call, send N separate verb="update" entries with a folder-qualified spec.name (e.g. "NewFolder/DS1", "NewFolder/DS2") and confirmRename:true on each \u2014 this already works today and needs no create entry; verb="create" is only for a BARE, empty folder with no data source moved into it yet.',
   items: {
@@ -22739,7 +24236,7 @@ var CHANGES_SCHEMA6 = {
     required: ["verb"]
   }
 };
-var TASK_SCHEMA6 = {
+var TASK_SCHEMA8 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -22827,7 +24324,7 @@ function makePreviewDataSourceChangesTool(deps) {
     description: `Resolve a set of proposed data source updates/deletes into a reviewable plan WITHOUT changing anything on the server. Every verb in this area is always high risk (requiresAgentSignoff is always true) and always requires a Tier-2 storage backup (requiresStorageBackup is always true). You MUST pass the returned planHash AND taskToken to apply_data_source_changes \u2014 the server writes the audit record from the task narrative embedded in taskToken (the one reviewed here), never from whatever task text apply_data_source_changes itself is called with. READ THIS BEFORE PREVIEWING AN UPDATE ON A JDBC DATA SOURCE WITH requireLogin=true: omitting password from spec leaves the real password unchanged \u2014 the server resolves it internally rather than trusting an echoed masked value, because the wrapped API's own read path can never return the real password in the first place. Sending back either masking literal as password is refused loud by this tool before the server is ever called. READ THIS BEFORE PREVIEWING A DELETE: this area's own dependency check (referencing queries/viewsheets/logical models) is independent, purpose-built logic \u2014 the wrapped server API's own "force" parameter is a confirmed no-op that deletes unconditionally regardless of its value, so this area's own preflight is the ONLY real safety net here, not a redundant belt-and-suspenders check. Delete has NO rollback in this cut (declared non-compensable) \u2014 apply_data_source_changes requires an explicit acknowledgeIrreversibleDelete:true for any plan containing a delete. An update whose spec includes "name" additionally requires confirmRename:true on that change entry, since a rename can auto-create missing parent folders as a side effect of what looks like an unrelated field edit. verb="create" (bug 76599, Gap 2a) creates a BARE, empty data source folder \u2014 no id/name/spec, and metadata-only (does not move or touch any data source); it needs no force/acknowledgeIrreversibleDelete/confirmRename, and its own rollback (if the overall apply fails) removes only the originally-requested leaf path, not any parent folder auto-created as a side effect. To move existing data sources into a folder, use verb="update" with a folder-qualified spec.name instead \u2014 see CHANGES_SCHEMA's own note on batch-moving N data sources in one call. This area is enterprise-only end to end; every tool in it 404s on a community-only deployment.`,
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA6, changes: CHANGES_SCHEMA6 },
+      properties: { task: TASK_SCHEMA8, changes: CHANGES_SCHEMA8 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -22845,8 +24342,8 @@ function makeApplyDataSourceChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA6,
-        changes: CHANGES_SCHEMA6,
+        task: TASK_SCHEMA8,
+        changes: CHANGES_SCHEMA8,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_data_source_changes for this exact plan"
@@ -22927,7 +24424,7 @@ function makeDataSourceTools(deps) {
 
 // src/tools/clusterTools.ts
 var PAUSE_DURABILITY_DISCLOSURE = `A successful pause is a LIVE SIGNAL, not a persistent policy: it does NOT survive the paused node restarting or temporarily leaving the cluster. A crash, a planned restart (the very event "pause for maintenance" exists to precede), or a transient network partition all silently clear the paused flag on rejoin \u2014 no error, no log line above DEBUG, and no signal to any caller, including this area's own tools, that the operator's last explicit pause silently stopped being true. If the intent is to keep a node out of rotation across such an event, re-issue pause after it rejoins; do not assume a past "verified" pause result still holds.`;
-var CHANGES_SCHEMA7 = {
+var CHANGES_SCHEMA9 = {
   type: "array",
   description: "the proposed pause/resume actions; each entry names a verb and a server. List each (verb, server) pair at most once. A server named with BOTH verbs in the same request is refused as contradictory, not a duplicate \u2014 split into two plans applied in sequence, or drop one.",
   items: {
@@ -22945,7 +24442,7 @@ var CHANGES_SCHEMA7 = {
     required: ["verb", "server"]
   }
 };
-var TASK_SCHEMA7 = {
+var TASK_SCHEMA9 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -22992,7 +24489,7 @@ function makePreviewClusterChangesTool(deps) {
     description: "Resolve a set of proposed cluster server pause/resume actions into a reviewable plan WITHOUT changing anything on the server. Every verb in this area is always high risk (requiresAgentSignoff is always true); no verb ever requires a Tier-2 storage backup (requiresStorageBackup is always false \u2014 the only state touched is a live, in-memory cluster-wide flag, not SreeEnv/storage). You MUST pass the returned planHash to apply_cluster_changes. An unrecognized server name is refused loud, naming it \u2014 there is no node to pause/resume, this is a hard refusal, not a downgrade. A pause on an already-Paused server (or resume on an already-non-Paused server) still produces a plan entry, described as a no-op, rather than being silently dropped. The whole plan is refused if cluster.pause.enabled is not turned on (a real, pre-existing gap this area's own service closes: the raw server endpoint enforces nothing here itself) \u2014 this applies to BOTH pause and resume, not just pause. Cluster node state can drift between preview and apply without any admin-chat action at all (a crash, another admin, another cluster member) \u2014 the plan hash captures each server's live current status, so any such drift is refused as a conflict on apply, never silently acted on with a stale assumption. " + PAUSE_DURABILITY_DISCLOSURE + " This area is NOT enterprise-gated \u2014 this tool works on a community-only deployment.",
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA7, changes: CHANGES_SCHEMA7 },
+      properties: { task: TASK_SCHEMA9, changes: CHANGES_SCHEMA9 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -23011,8 +24508,8 @@ function makeApplyClusterChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA7,
-        changes: CHANGES_SCHEMA7,
+        task: TASK_SCHEMA9,
+        changes: CHANGES_SCHEMA9,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_cluster_changes for this exact plan"
@@ -23074,6 +24571,206 @@ function makeClusterTools(deps) {
     makeGetClusterNodeTool(deps),
     makePreviewClusterChangesTool(deps),
     makeApplyClusterChangesTool(deps)
+  ];
+}
+
+// src/tools/schedulerStatusTools.ts
+var RESTART_APPLY_TIMEOUT_MS = 6e4;
+var CLUSTER_REFUSAL_DISCLOSURE = "start/stop/restart is refused ENTIRELY on a clustered deployment \u2014 the underlying server call has no way to target a specific cluster node (it always acts on whichever JVM handles the request), and the real Enterprise Manager UI already hides the whole Start/Stop/Restart button row for the identical reason. This is a faithful product boundary, not a gap this area closes; get_scheduler_status still works on a clustered deployment (it just reports each node's uptime instead of a single running/stopped flag).";
+var VERB_SIDE_EFFECT_DISCLOSURE = `Every verb has a real side effect beyond the state transition its name suggests: "start" always performs an unconditional stop, then start, even when the scheduler is already running (an existing product quirk, not something this area introduces); "stop" also fires the product's own configured "scheduler down" notification email, the same as clicking Stop in Enterprise Manager; "restart" stops the scheduler, waits up to 30s server-side for it to actually stop, and only then starts it again \u2014 if that 30s window elapses first, the scheduler is left STOPPED, not restarted, and this is reported as a failed outcome naming exactly that, never a generic "restart failed".`;
+var CHANGES_SCHEMA10 = {
+  type: "array",
+  description: 'exactly one entry \u2014 this area addresses a single target, "the scheduler", never a batch. Each entry names a verb.',
+  items: {
+    type: "object",
+    properties: {
+      verb: {
+        type: "string",
+        description: '"start", "stop", or "restart" (no aliases)'
+      }
+    },
+    required: ["verb"]
+  }
+};
+var TASK_SCHEMA10 = {
+  type: "string",
+  description: "a short description of what this change accomplishes; written into every audit record for the transaction"
+};
+function makeGetSchedulerStatusTool(deps) {
+  return {
+    name: "get_scheduler_status",
+    description: 'Read the scheduler\'s current status. On a non-clustered deployment, returns { cluster: false, status, running, externalStorageLocation }. On a clustered deployment, returns { cluster: true, clusterStatusTable: [{ server, uptime }, ...], externalStorageLocation } instead \u2014 there is no per-node running/stopped flag in that shape, only uptime (or "Not ready"). `externalStorageLocation` is where get_scheduler_heap_dump_status writes a completed heap dump\'s .hprof.gz file, under a "heapdump/" subfolder. No arguments. This area is NOT enterprise-gated \u2014 this tool works on a community-only deployment.',
+    inputSchema: { type: "object", properties: {} },
+    call: async () => {
+      await assertStyleBIRouting(deps.tokenStore);
+      return deps.wizClient.get("/v1/admin/scheduler/status");
+    }
+  };
+}
+function makePreviewSchedulerStatusChangesTool(deps) {
+  return {
+    name: "preview_scheduler_status_changes",
+    description: "Resolve a proposed scheduler start/stop/restart into a reviewable plan WITHOUT changing anything on the server. Always high risk (requiresAgentSignoff is always true); never requires a Tier-2 storage backup (requiresStorageBackup is always false). You MUST pass the returned planHash AND taskToken to apply_scheduler_status_changes. " + CLUSTER_REFUSAL_DISCLOSURE + " " + VERB_SIDE_EFFECT_DISCLOSURE + " This area is NOT enterprise-gated \u2014 this tool works on a community-only deployment.",
+    inputSchema: {
+      type: "object",
+      properties: { task: TASK_SCHEMA10, changes: CHANGES_SCHEMA10 },
+      required: ["task", "changes"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      return deps.wizClient.post("/v1/admin/scheduler/preview", {
+        task: requireTask(args?.task),
+        changes: normalizeSchedulerStatusChanges(args?.changes)
+      });
+    }
+  };
+}
+function makeApplySchedulerStatusChangesTool(deps) {
+  return {
+    name: "apply_scheduler_status_changes",
+    description: `Apply a previewed scheduler start/stop/restart plan. Pass back the SAME task and changes you previewed plus the planHash AND taskToken from preview_scheduler_status_changes \u2014 the server writes the audit record from the task narrative embedded in taskToken, never from whatever task text this call itself is made with. A non-blank reviewOutcome is always required. There is no "partial" status in this area (unlike Cluster's own batch apply) \u2014 the overall result is "applied" (verified), "failed" (not verified \u2014 including a restart that timed out stopping, in which case the scheduler has been left stopped, not restarted), or "conflict" (the plan drifted since preview \u2014 nothing was applied). There is no "rolled-back"/"rollback-failed" status either \u2014 "rollback", to the extent this area has one at all, is calling this SAME tool again with the complementary verb (stop undoes start and vice versa; restart's own undo is simply restart again, or stop if the intent was "actually turn it off"). A "restart" entry can legitimately take up to a minute end to end (the server's own up-to-30s internal stop-wait, plus real stop/start durations) \u2014 this tool automatically extends its own request timeout for that verb specifically, so a slow-but-successful restart is not misreported as a network failure. ` + CLUSTER_REFUSAL_DISCLOSURE + " " + VERB_SIDE_EFFECT_DISCLOSURE + " This area is NOT enterprise-gated \u2014 this tool works on a community-only deployment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: TASK_SCHEMA10,
+        changes: CHANGES_SCHEMA10,
+        planHash: {
+          type: "string",
+          description: "the planHash returned by preview_scheduler_status_changes for this exact plan"
+        },
+        taskToken: {
+          type: "string",
+          description: "the taskToken returned by preview_scheduler_status_changes for this exact plan. The server writes the audit record from the task narrative embedded in this token, not from this call's own task field."
+        },
+        reviewOutcome: {
+          type: "string",
+          description: "the reviewer's verdict, recorded on the audit record; always required in this area"
+        }
+      },
+      required: ["task", "changes", "planHash", "taskToken"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      if (typeof args?.planHash !== "string" || args.planHash.trim() === "") {
+        throw new Error(
+          "planHash: required \u2014 the hash returned by preview_scheduler_status_changes for this plan. Call preview_scheduler_status_changes first."
+        );
+      }
+      if (typeof args?.taskToken !== "string" || args.taskToken.trim() === "") {
+        throw new Error(
+          "taskToken: required \u2014 the token returned by preview_scheduler_status_changes for this plan. Without it the server cannot verify which reviewed task narrative to audit. Call preview_scheduler_status_changes first."
+        );
+      }
+      const changes = normalizeSchedulerStatusChanges(args.changes);
+      const body = {
+        task: requireTask(args.task),
+        changes,
+        planHash: args.planHash.trim(),
+        taskToken: args.taskToken.trim()
+      };
+      const reviewOutcome = normalizeReviewOutcome(args.reviewOutcome);
+      if (reviewOutcome !== void 0) {
+        body.reviewOutcome = reviewOutcome;
+      }
+      const isRestart = changes.some((c) => c.verb === "restart");
+      try {
+        return await deps.wizClient.post(
+          "/v1/admin/scheduler/apply",
+          body,
+          isRestart ? { timeoutMs: RESTART_APPLY_TIMEOUT_MS } : void 0
+        );
+      } catch (err) {
+        const e = err;
+        if (e?.code === "HTTP_409") {
+          const detail = e.detail ?? {};
+          return {
+            status: "conflict",
+            error: typeof detail.error === "string" ? detail.error : e.message ?? "the plan no longer matches the planHash",
+            plan: detail.plan ?? null,
+            guidance: "The plan drifted between preview_scheduler_status_changes and apply_scheduler_status_changes \u2014 the scheduler's status changed (someone restarted it, Enterprise Manager, or another admin-chat call) between preview and apply. NOTHING was applied. Show the returned `plan` to the user as a fresh diff, get confirmation again, then call apply_scheduler_status_changes with the planHash from THAT plan."
+          };
+        }
+        throw err;
+      }
+    }
+  };
+}
+function makeGetSchedulerThreadDumpTool(deps) {
+  return {
+    name: "get_scheduler_thread_dump",
+    description: "Read a snapshot of the scheduler's current thread stack traces \u2014 a plain, read-only diagnostic, no preview/plan/signoff involved (a thread dump has no side effect beyond the brief pause the JVM already takes for any thread dump). `clusterNode` (optional) is the IP of a specific scheduler-tagged cluster node. If omitted and more than one scheduler-tagged node exists, this is refused loud, naming the candidates \u2014 unlike the raw Enterprise Manager endpoint, which silently returns only the first match in that situation. This area is NOT enterprise-gated \u2014 this tool works on a community-only deployment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        clusterNode: {
+          type: "string",
+          description: "the IP of a specific scheduler-tagged cluster node; omit on a non-clustered deployment"
+        }
+      }
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const clusterNode = typeof args?.clusterNode === "string" && args.clusterNode.trim() !== "" ? args.clusterNode.trim() : void 0;
+      const query = clusterNode !== void 0 ? `?clusterNode=${encodeURIComponent(clusterNode)}` : "";
+      return deps.wizClient.get(`/v1/admin/scheduler/thread-dump${query}`);
+    }
+  };
+}
+function makeKickOffSchedulerHeapDumpTool(deps) {
+  return {
+    name: "kick_off_scheduler_heap_dump",
+    description: 'Kick off an asynchronous heap dump of the scheduler process. Returns { token, node }; poll with get_scheduler_heap_dump_status, passing back BOTH token and node. `clusterNode` (optional) is the IP of a specific scheduler-tagged cluster node. If omitted and more than one scheduler-tagged node exists, this is refused loud, naming the candidates \u2014 unlike the raw Enterprise Manager endpoint, which silently picks the first match in that situation. No preview/planHash/signoff step: a heap dump snapshot has no diffable "before" state, and creating one twice just produces two dumps, not a corrupted one \u2014 the same reasoning rebuild_dependencies/repair_repository_folders already establish for this shape elsewhere in this plugin. This area is NOT enterprise-gated \u2014 this tool works on a community-only deployment.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        clusterNode: {
+          type: "string",
+          description: "the IP of a specific scheduler-tagged cluster node; omit on a non-clustered deployment"
+        }
+      }
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const clusterNode = typeof args?.clusterNode === "string" && args.clusterNode.trim() !== "" ? args.clusterNode.trim() : void 0;
+      return deps.wizClient.post("/v1/admin/scheduler/heap-dump", { clusterNode });
+    }
+  };
+}
+function makeGetSchedulerHeapDumpStatusTool(deps) {
+  return {
+    name: "get_scheduler_heap_dump_status",
+    description: "Poll the status of a kick_off_scheduler_heap_dump call: { token, complete, failed, error?, storagePath? }. Pass back the SAME `node` kick_off_scheduler_heap_dump returned alongside the token \u2014 the server needs it to know which cluster node's heap dump this token refers to. Once `complete` is true, `storagePath` (when not `failed`) names where the resulting .hprof.gz file was written under external storage's \"heapdump/\" folder (see get_scheduler_status's own externalStorageLocation for the storage root). Polling the SAME token again after it first reports complete returns the identical result again \u2014 it does not re-run the materialization or error out.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        token: { type: "string", description: "the token returned by kick_off_scheduler_heap_dump" },
+        node: {
+          type: "string",
+          description: "the node returned by kick_off_scheduler_heap_dump alongside this token; omit only if kick_off_scheduler_heap_dump itself returned a null/absent node"
+        }
+      },
+      required: ["token"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      if (typeof args?.token !== "string" || args.token.trim() === "") {
+        throw new Error("token: required \u2014 the token returned by kick_off_scheduler_heap_dump");
+      }
+      const token = args.token.trim();
+      const node = typeof args?.node === "string" && args.node.trim() !== "" ? args.node.trim() : void 0;
+      const query = node !== void 0 ? `?clusterNode=${encodeURIComponent(node)}` : "";
+      return deps.wizClient.get(`/v1/admin/scheduler/heap-dump/${encodeURIComponent(token)}/status${query}`);
+    }
+  };
+}
+function makeSchedulerStatusTools(deps) {
+  return [
+    makeGetSchedulerStatusTool(deps),
+    makePreviewSchedulerStatusChangesTool(deps),
+    makeApplySchedulerStatusChangesTool(deps),
+    makeGetSchedulerThreadDumpTool(deps),
+    makeKickOffSchedulerHeapDumpTool(deps),
+    makeGetSchedulerHeapDumpStatusTool(deps)
   ];
 }
 
@@ -23183,7 +24880,7 @@ function makeRepositoryMaintenanceTools(deps) {
 import fs3 from "fs";
 import os from "os";
 import nodePath2 from "path";
-var CHANGES_SCHEMA8 = {
+var CHANGES_SCHEMA11 = {
   type: "array",
   description: 'the proposed stored-asset changes; each entry is { unitType, verb, path, newName|content }. unitType ("file"|"folder") is a discriminator FIRST \u2014 valid verbs depend on it: "folder" accepts create/rename/delete, "file" accepts write/rename/delete. path is a DataSpace-relative path (no leading "/", no ".." segment \u2014 refused loud, never silently sanitized). List each path at most once.',
   items: {
@@ -23210,7 +24907,7 @@ var CHANGES_SCHEMA8 = {
     required: ["unitType", "verb", "path"]
   }
 };
-var TASK_SCHEMA8 = {
+var TASK_SCHEMA11 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -23388,7 +25085,7 @@ function makePreviewStoredAssetChangesTool(deps) {
     description: 'Resolve a set of proposed stored-asset changes (create/write/rename/delete) into a reviewable plan WITHOUT changing anything on the server. Every plan in this area always requires a Tier-2 storage backup (requiresStorageBackup is always true); requiresAgentSignoff is true whenever any entry overwrites/deletes existing content. You MUST pass the returned planHash AND taskToken to apply_stored_asset_changes \u2014 the server writes the audit record from the task narrative embedded in taskToken (the one reviewed here), never from whatever task text apply_stored_asset_changes itself is called with. A "create" over an existing path, or a "rename" onto an existing destination, is refused loud rather than silently overwritten. A folder delete is ALWAYS non-compensable (no live rollback); a file write/delete MAY be non-compensable depending on live server-side state (size cap, UTF-8 decodability) \u2014 either case requires acknowledgeIrreversibleDelete:true on the matching apply_stored_asset_changes call.',
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA8, changes: CHANGES_SCHEMA8 },
+      properties: { task: TASK_SCHEMA11, changes: CHANGES_SCHEMA11 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -23406,8 +25103,8 @@ function makeApplyStoredAssetChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA8,
-        changes: CHANGES_SCHEMA8,
+        task: TASK_SCHEMA11,
+        changes: CHANGES_SCHEMA11,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_stored_asset_changes for this exact plan"
@@ -23502,25 +25199,40 @@ function makeListDriversAndPluginsTool(deps) {
 function makeUploadDriverOrPluginTool(deps) {
   return {
     name: "upload_driver_or_plugin",
-    description: `Upload a local .jar (a raw JDBC driver) or .zip (a full StyleBI plugin) file for later install. Returns { uploadId, fileName }. Nothing is installed yet and nothing observable to a user changes \u2014 read-only from the deployment's own installed-state point of view, so there is no acknowledgment gate here, matching upload_csv_table/upload_excel_table and export_assets's own "nothing mutates yet" precedent. Next step: for a bare .jar, call scan_uploaded_drivers to find its driver class name(s) before install_driver_or_plugin; for a .zip plugin, call install_driver_or_plugin directly.`,
+    description: `Upload a driver/plugin for later install, either from a local file or by resolving a Maven coordinate \u2014 exactly one of filePath/mavenCoord is required. filePath: a local .jar (a raw JDBC driver) or .zip (a full StyleBI plugin) file; returns { uploadId, fileName } (singular \u2014 a local upload is always exactly one file). mavenCoord: a Maven coordinate group:artifact:version, resolved server-side; returns { uploadId, fileNames } (an array \u2014 a real JDBC driver's transitive dependencies commonly resolve to more than one jar, so do not assume a single name back). Nothing is installed yet and nothing observable to a user changes \u2014 read-only from the deployment's own installed-state point of view, so there is no acknowledgment gate here, matching upload_csv_table/upload_excel_table and export_assets's own "nothing mutates yet" precedent. Next step: for a bare .jar (or a resolved mavenCoord), call scan_uploaded_drivers to find its driver class name(s) before install_driver_or_plugin; for a .zip plugin, call install_driver_or_plugin directly.`,
     inputSchema: {
       type: "object",
       properties: {
-        filePath: { type: "string", description: "Absolute path to a local .jar or .zip file." }
-      },
-      required: ["filePath"]
+        filePath: { type: "string", description: "Absolute path to a local .jar or .zip file." },
+        mavenCoord: {
+          type: "string",
+          description: "Maven coordinate group:artifact:version, resolved server-side."
+        }
+      }
     },
     call: async (args) => {
       await assertStyleBIRouting(deps.tokenStore);
-      const filePath = requireFilePath(args);
+      const obj = typeof args === "object" && args !== null ? args : {};
+      const hasFilePath = typeof obj.filePath === "string" && obj.filePath.trim() !== "";
+      const hasMavenCoord = typeof obj.mavenCoord === "string" && obj.mavenCoord.trim() !== "";
+      if (hasFilePath === hasMavenCoord) {
+        throw new Error(
+          `filePath/mavenCoord: exactly one is required, got ${hasFilePath ? "both" : "neither"}`
+        );
+      }
+      if (hasMavenCoord) {
+        const mavenCoord = requireMavenCoord(obj);
+        return deps.wizClient.post("/v1/admin/plugins/upload/maven", { gav: mavenCoord });
+      }
+      const filePath = requireFilePath(obj);
       const ext = filePath.split(".").pop()?.toLowerCase();
       if (ext !== "jar" && ext !== "zip") {
         throw new Error(
           `filePath: must be a .jar (raw JDBC driver) or .zip (StyleBI plugin) file, got: ${filePath}`
         );
       }
-      const { readFile: readFile2 } = await import("fs/promises");
-      const bytes = await readFile2(filePath);
+      const { readFile: readFile3 } = await import("fs/promises");
+      const bytes = await readFile3(filePath);
       const fileName = filePath.split(/[\\/]/).pop() ?? `upload.${ext}`;
       const form = new FormData();
       form.append("file", new Blob([bytes]), fileName);
@@ -23531,7 +25243,7 @@ function makeUploadDriverOrPluginTool(deps) {
 function makeScanUploadedDriversTool(deps) {
   return {
     name: "scan_uploaded_drivers",
-    description: "Scan an uploaded .jar for its JDBC driver class name(s): { drivers: [className...] }. Only meaningful for a bare driver jar upload \u2014 the server refuses loud (not an empty list) both when uploadId is unrecognized/expired and when the upload scans clean of any driver class (e.g. because it was actually a full plugin zip, which does not need scanning at all \u2014 call install_driver_or_plugin directly for that case instead).",
+    description: "Scan an uploaded driver jar (or jars) for its JDBC driver class name(s): { drivers: [className...] }. Only meaningful for a bare driver jar upload \u2014 the server refuses loud (not an empty list) both when uploadId is unrecognized/expired and when the upload scans clean of any driver class (e.g. because it was actually a full plugin zip, which does not need scanning at all \u2014 call install_driver_or_plugin directly for that case instead). For an uploadId from a mavenCoord resolve (upload_driver_or_plugin's fileNames array \u2014 commonly more than one jar, driver plus transitive dependencies), the scan covers every jar under that uploadId, not just the first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -23640,6 +25352,19 @@ function requireFilePath(args) {
   }
   return raw.trim();
 }
+function requireMavenCoord(args) {
+  const obj = typeof args === "object" && args !== null ? args : {};
+  const raw = obj.mavenCoord;
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new Error("mavenCoord: required (group:artifact:version)");
+  }
+  const trimmed = raw.trim();
+  const parts = trimmed.split(":").map((part) => part.trim());
+  if (parts.length !== 3 || parts.some((part) => part === "")) {
+    throw new Error(`mavenCoord: must be group:artifact:version, got: ${trimmed}`);
+  }
+  return parts.join(":");
+}
 function makePluginManagementTools(deps) {
   return [
     makeListDriversAndPluginsTool(deps),
@@ -23651,7 +25376,7 @@ function makePluginManagementTools(deps) {
 }
 
 // src/tools/viewsheetTools.ts
-var CHANGES_SCHEMA9 = {
+var CHANGES_SCHEMA12 = {
   type: "array",
   description: `the proposed viewsheet/folder/worksheet changes; each entry names unitType FIRST \u2014 set it correctly before adding other fields, since a field belonging to a different unit type, or to a verb this entry doesn't use, is refused loud, never silently dropped. A single plan may freely mix unitType="viewsheet", unitType="folder", and unitType="worksheet" entries.`,
   items: {
@@ -23709,28 +25434,22 @@ var CHANGES_SCHEMA9 = {
     required: ["unitType", "verb"]
   }
 };
-var TASK_SCHEMA9 = {
+var TASK_SCHEMA12 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
 function makeListViewsheetsTool(deps) {
   return {
     name: "list_viewsheets",
-    description: `List viewsheets (dashboards) the caller can read, in the resolved organization \u2014 both the shared repository tree and the caller's own "My Dashboards" tree, recycle-bin entries excluded. organizationid is optional and defaults to the caller's own current organization. When security.exposedefaultorgtoall is enabled, the result may also include the host organization's own global viewsheets for a caller in a different organization \u2014 that is expected, not a bug. There is no single-item get_viewsheet tool (none exists on the underlying service) \u2014 filter this list's result by assetId, or rely on preview_viewsheet_changes' own structured not-found error on a bad assetId.`,
+    description: `List viewsheets (dashboards) the caller can read, in the caller's CURRENT organization \u2014 both the shared repository tree and the caller's own "My Dashboards" tree, recycle-bin entries excluded. To list a DIFFERENT organization's viewsheets, call switch_organization first \u2014 this tool takes no org argument of its own. When security.exposedefaultorgtoall is enabled, the result may also include the host organization's own global viewsheets for a caller in a different organization \u2014 that is expected, not a bug. There is no single-item get_viewsheet tool (none exists on the underlying service) \u2014 filter this list's result by assetId, or rely on preview_viewsheet_changes' own structured not-found error on a bad assetId.`,
     inputSchema: {
       type: "object",
-      properties: {
-        organizationid: {
-          type: "string",
-          description: "optional; defaults to the caller's own current organization"
-        }
-      }
+      properties: {}
     },
     call: async (args) => {
       await assertStyleBIRouting(deps.tokenStore);
-      const orgId = typeof args?.organizationid === "string" ? args.organizationid.trim() : "";
-      const query = orgId === "" ? "" : `?organizationid=${encodeURIComponent(orgId)}`;
-      return deps.wizClient.get(`/v1/admin/viewsheets${query}`);
+      requireNoOrgScopeParam(args?.organizationid, "organizationid", "list_viewsheets");
+      return deps.wizClient.get("/v1/admin/viewsheets");
     }
   };
 }
@@ -23761,7 +25480,7 @@ function makePreviewViewsheetChangesTool(deps) {
     description: `Resolve a set of proposed viewsheet renames/deletes and folder creates/deletes/renames into a reviewable plan WITHOUT changing anything on the server -- unitType="worksheet" (Track B/Redmine #76604 Gap7) shares viewsheet's own rename/delete verbs, plus a new "update" verb (alias/description only, RISK_LOW, available on all three unit types) that never renames or moves anything, regardless of unitType. UNLIKE every other storage-scoped area in this plugin, requiresAgentSignoff is NOT unconditionally true here \u2014 risk genuinely varies by verb, and (for folder delete) by folder content: a plan containing any viewsheet or worksheet verb="rename"/"delete" (rename or delete) is high risk and requires signoff; a plan containing ONLY folder verbs is low-medium risk UNLESS it includes a delete of a NON-EMPTY folder \u2014 that single entry is risk:"high" and drives requiresAgentSignoff:true for the whole plan, exactly like a viewsheet delete does (Redmine #76469 fix). A plan containing only "update" entries needs no signoff. requiresStorageBackup is always true for every verb in this area regardless of risk. READ THIS BEFORE PREVIEWING A VIEWSHEET DELETE: this area's own dependency check (referencing other assets) is independent, purpose-built logic \u2014 the underlying Public API always deletes unconditionally with no dependency check of its own, so this area's own preflight is the ONLY real safety net here. A viewsheet OR WORKSHEET delete has NO rollback in this cut (declared non-compensable) \u2014 apply_viewsheet_changes requires an explicit acknowledgeIrreversibleDelete:true for any plan containing either. A worksheet delete's own dependency check matters at least as much as a viewsheet's, since a worksheet is commonly the data-binding source for one or more viewsheets. READ THIS BEFORE PREVIEWING A FOLDER DELETE: this PERMANENTLY AND IRRECOVERABLY deletes every viewsheet and worksheet stored under the folder, recursively including nested folders \u2014 StyleBI hard-deletes each contained asset from storage the moment the delete is applied. There is no recycle bin and no rollback. Risk and gating now genuinely depend on folder content (Redmine #76469 fix): an EMPTY folder is risk:"low" and applies with neither flag; a NON-EMPTY folder is risk:"high", names every contained viewsheet/worksheet in this plan's description, and apply_viewsheet_changes then requires BOTH force:true on that entry AND acknowledgeIrreversibleDelete:true on the request \u2014 exactly as irreversible as a viewsheet delete, just at the scale of an entire subtree, and now gated the same way. READ THIS BEFORE PREVIEWING A FOLDER RENAME: unlike delete, a folder rename is NOT metadata-only \u2014 it REWRITES the path/asset-identifier of every viewsheet and worksheet stored under the renamed folder (recursively, including nested folders), because StyleBI keeps the registry folder label and the underlying asset-tree folder in sync for a direct rename. Disclose this plainly to the human before a folder-rename plan is applied \u2014 any external reference to the affected viewsheets by full path/asset id (schedule tasks, bookmarks, hyperlinks, other automation) can go stale as a result. You MUST pass the returned planHash AND taskToken to apply_viewsheet_changes: the server writes the audit record from the task narrative embedded in taskToken \u2014 the one reviewed here \u2014 never from whatever task text apply_viewsheet_changes itself is called with.`,
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA9, changes: CHANGES_SCHEMA9 },
+      properties: { task: TASK_SCHEMA12, changes: CHANGES_SCHEMA12 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -23785,8 +25504,8 @@ function makeApplyViewsheetChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA9,
-        changes: CHANGES_SCHEMA9,
+        task: TASK_SCHEMA12,
+        changes: CHANGES_SCHEMA12,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_viewsheet_changes for this exact plan"
@@ -23872,21 +25591,15 @@ function makeViewsheetTools(deps) {
 function makeListWorksheetsTool(deps) {
   return {
     name: "list_worksheets",
-    description: `List worksheets the caller can read, in the resolved organization \u2014 both the shared repository tree and the caller's own per-user tree, recycle-bin entries excluded. organizationid is optional and defaults to the caller's own current organization. When security.exposedefaultorgtoall is enabled, the result may also include the host organization's own global worksheets for a caller in a different organization \u2014 that is expected, not a bug (the same filtering/visibility rules list_viewsheets already applies). There is no single-item get_worksheet tool (none exists on the underlying service) \u2014 filter this list's result by assetId, or rely on preview_viewsheet_changes' own structured not-found error on a bad assetId. To rename/delete/update a worksheet's alias or description, use preview_viewsheet_changes/apply_viewsheet_changes with unitType: "worksheet" \u2014 there is no separate worksheet preview/apply pair.`,
+    description: `List worksheets the caller can read, in the caller's CURRENT organization \u2014 both the shared repository tree and the caller's own per-user tree, recycle-bin entries excluded. To list a DIFFERENT organization's worksheets, call switch_organization first \u2014 this tool takes no org argument of its own. When security.exposedefaultorgtoall is enabled, the result may also include the host organization's own global worksheets for a caller in a different organization \u2014 that is expected, not a bug (the same filtering/visibility rules list_viewsheets already applies). There is no single-item get_worksheet tool (none exists on the underlying service) \u2014 filter this list's result by assetId, or rely on preview_viewsheet_changes' own structured not-found error on a bad assetId. To rename/delete/update a worksheet's alias or description, use preview_viewsheet_changes/apply_viewsheet_changes with unitType: "worksheet" \u2014 there is no separate worksheet preview/apply pair.`,
     inputSchema: {
       type: "object",
-      properties: {
-        organizationid: {
-          type: "string",
-          description: "optional; defaults to the caller's own current organization"
-        }
-      }
+      properties: {}
     },
     call: async (args) => {
       await assertStyleBIRouting(deps.tokenStore);
-      const orgId = typeof args?.organizationid === "string" ? args.organizationid.trim() : "";
-      const query = orgId === "" ? "" : `?organizationid=${encodeURIComponent(orgId)}`;
-      return deps.wizClient.get(`/v1/admin/worksheets${query}`);
+      requireNoOrgScopeParam(args?.organizationid, "organizationid", "list_worksheets");
+      return deps.wizClient.get("/v1/admin/worksheets");
     }
   };
 }
@@ -23895,7 +25608,7 @@ function makeWorksheetTools(deps) {
 }
 
 // src/tools/dashboardTools.ts
-var CHANGES_SCHEMA10 = {
+var CHANGES_SCHEMA13 = {
   type: "array",
   description: 'the proposed dashboard/dashboard-folder changes; each entry names unitType FIRST \u2014 set it correctly before adding other fields, since a field belonging to a different unit type or verb is refused loud, never silently dropped. A single plan may freely mix unitType="dashboard" and unitType="dashboardFolder" entries. This is the admin-configured "Portal Dashboard Tab" (global, owner omitted) / "User Portal Dashboard Tab" (owner set) feature \u2014 a genuine structural Repository-tree entry (name, description, bound viewsheet, enable/disable, folder ordering), NOT the self-service per-user "pin a dashboard" feature, which this tool surface does not cover at all.',
   items: {
@@ -23942,7 +25655,7 @@ var CHANGES_SCHEMA10 = {
     required: ["unitType", "verb"]
   }
 };
-var TASK_SCHEMA10 = {
+var TASK_SCHEMA13 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -24022,7 +25735,7 @@ function makePreviewDashboardChangesTool(deps) {
     description: `Resolve a set of proposed Portal Dashboard creates/updates/deletes and dashboard-folder reorders into a reviewable plan WITHOUT changing anything on the server. requiresAgentSignoff is true whenever the plan contains a dashboard delete (risk:"high") or a rename (a dashboard update whose name differs from oname, also risk:"high") \u2014 a non-renaming update, a create, and a folder reorder are all risk:"low". requiresStorageBackup is always true for every verb in this area. UNLIKE the viewsheet area, a dashboard delete here only removes the Repository-tree registry binding (name/description/viewsheet reference) \u2014 it never deletes the bound viewsheet's own content \u2014 so it is fully compensable and there is no acknowledgeIrreversibleDelete flag anywhere in this area at all; apply_dashboard_changes only ever needs reviewOutcome, and only when requiresAgentSignoff is true. You MUST pass the returned planHash AND taskToken to apply_dashboard_changes: the server writes the audit record from the task narrative embedded in taskToken \u2014 the one reviewed here \u2014 never from whatever task text apply_dashboard_changes itself is called with.`,
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA10, changes: CHANGES_SCHEMA10 },
+      properties: { task: TASK_SCHEMA13, changes: CHANGES_SCHEMA13 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -24041,8 +25754,8 @@ function makeApplyDashboardChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA10,
-        changes: CHANGES_SCHEMA10,
+        task: TASK_SCHEMA13,
+        changes: CHANGES_SCHEMA13,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_dashboard_changes for this exact plan"
@@ -24127,25 +25840,29 @@ function attachDeLicensingWarning(responseBody, deLicensingWarning) {
   }
   return responseBody;
 }
-var CHANGES_SCHEMA11 = {
+var CHANGES_SCHEMA14 = {
   type: "array",
-  description: "the proposed license key add/remove actions; each entry names a verb and the key itself. List each (verb, key) pair at most once. A key named with BOTH verbs in the same request is refused as contradictory, not a duplicate \u2014 split into two plans applied in sequence, or drop one.",
+  description: 'the proposed license key add/remove/update actions; each entry names a verb and the key itself (update also names newKey). List each (verb, key) pair at most once. A key named with BOTH "add" and "remove" in the same request is refused as contradictory, not a duplicate \u2014 split into two plans applied in sequence, or drop one.',
   items: {
     type: "object",
     properties: {
       verb: {
         type: "string",
-        description: '"add" (alias "install") or "remove" (aliases "uninstall"/"delete"). There is no "update"/"replace"/"set" verb for this resource \u2014 a license key is not edited in place; submitting one of those is refused loud, naming the two real verbs, never silently guessed as "add".'
+        description: '"add" (alias "install"), "remove" (aliases "uninstall"/"delete"), or "update" (alias "edit") to replace an installed key with another via the server\'s own atomic replace primitive \u2014 the same one Enterprise Manager\'s "Edit License Key" dialog uses for a single-key swap. "update" requires `newKey` in addition to `key`; "replace"/"set" are refused loud, pointing at "update", never silently guessed.'
       },
       key: {
         type: "string",
-        description: 'the literal license key string \u2014 the ONLY identifier for this resource, no separate id/name field exists. `id`/`name`/`licenseKey` are accepted aliases for this same field. For "remove", pass the exact string as returned by list_license_keys/get_license_key.'
+        description: 'the literal license key string \u2014 the ONLY identifier for this resource, no separate id/name field exists. `id`/`name`/`licenseKey` are accepted aliases for this same field. For "remove"/"update", pass the exact CURRENTLY INSTALLED string as returned by list_license_keys/get_license_key \u2014 for "update" this is the key being replaced.'
+      },
+      newKey: {
+        type: "string",
+        description: 'only meaningful for verb "update" (required there, refused on any other verb): the key to install in place of `key`. Must differ from `key` and must not already be installed.'
       }
     },
     required: ["verb", "key"]
   }
 };
-var TASK_SCHEMA11 = {
+var TASK_SCHEMA14 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -24179,10 +25896,10 @@ function makeGetLicenseKeyTool(deps) {
 function makePreviewLicenseChangesTool(deps) {
   return {
     name: "preview_license_changes",
-    description: 'Resolve a set of proposed license key add/remove actions into a reviewable plan WITHOUT changing anything on the server. Every verb in this area is always high risk (requiresAgentSignoff is always true) and always requires a Tier-2 storage backup (requiresStorageBackup is always true) \u2014 a license key change can gate every licensed feature/session/named-user count across the whole deployment for every organization at once. You MUST pass both the returned planHash AND taskToken to apply_license_changes: the server re-resolves the plan and refuses with a conflict if anything drifted, and it writes the audit record from the task narrative embedded in taskToken -- the one reviewed here -- never from whatever task text apply_license_changes itself is called with. An "add" whose key fails to parse or resolves to an invalid license type is refused loud, naming the key, rather than being silently installed as a permanently-broken entry (the underlying product itself never rejects a malformed key at install time). A "remove" of a key that is not currently installed is refused loud, naming the key, rather than silently succeeding as a no-op. ' + ALREADY_INSTALLED_ADD_DISCLOSURE + " If the resolved plan would leave ZERO license keys installed (a full de-licensing event), the response carries a first-class deLicensingWarning:true field \u2014 surface this to the human explicitly before apply, since apply_license_changes will then require acknowledgeDelicensing:true. deLicensingWarning is computed by this tool from a separate live read of the installed-key count made alongside the preview call, so there is a small race window against a concurrent add/remove elsewhere \u2014 acceptable for an advisory-only preview signal, since the real enforcement gate is apply_license_changes' own acknowledgeDelicensing requirement, re-resolved fresh at apply time. " + ENTERPRISE_GATE_DISCLOSURE,
+    description: 'Resolve a set of proposed license key add/remove/update actions into a reviewable plan WITHOUT changing anything on the server. Every verb in this area is always high risk (requiresAgentSignoff is always true) and always requires a Tier-2 storage backup (requiresStorageBackup is always true) \u2014 a license key change can gate every licensed feature/session/named-user count across the whole deployment for every organization at once. You MUST pass both the returned planHash AND taskToken to apply_license_changes: the server re-resolves the plan and refuses with a conflict if anything drifted, and it writes the audit record from the task narrative embedded in taskToken -- the one reviewed here -- never from whatever task text apply_license_changes itself is called with. An "add" whose key fails to parse or resolves to an invalid license type is refused loud, naming the key, rather than being silently installed as a permanently-broken entry (the underlying product itself never rejects a malformed key at install time). A "remove" of a key that is not currently installed is refused loud, naming the key, rather than silently succeeding as a no-op. An "update" (Redmine #76694) replaces one installed key with another atomically \u2014 `key`\'s old license and `newKey`\'s new one are swapped in a single server-side operation, the same primitive Enterprise Manager\'s own "Edit License Key" dialog uses, so there is no window where the deployment is left with neither key installed. It is refused loud, naming the field, if `key` is not currently installed, if `newKey` equals `key`, if `newKey` is already installed as a different key, or if `newKey` fails to parse or resolves to an invalid license type \u2014 never silently treated as a plain add/remove pair. ' + ALREADY_INSTALLED_ADD_DISCLOSURE + " If the resolved plan would leave ZERO license keys installed (a full de-licensing event), the response carries a first-class deLicensingWarning:true field \u2014 surface this to the human explicitly before apply, since apply_license_changes will then require acknowledgeDelicensing:true. deLicensingWarning is computed by this tool from a separate live read of the installed-key count made alongside the preview call, so there is a small race window against a concurrent add/remove elsewhere \u2014 acceptable for an advisory-only preview signal, since the real enforcement gate is apply_license_changes' own acknowledgeDelicensing requirement, re-resolved fresh at apply time. " + ENTERPRISE_GATE_DISCLOSURE,
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA11, changes: CHANGES_SCHEMA11 },
+      properties: { task: TASK_SCHEMA14, changes: CHANGES_SCHEMA14 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -24201,12 +25918,12 @@ function makePreviewLicenseChangesTool(deps) {
 function makeApplyLicenseChangesTool(deps) {
   return {
     name: "apply_license_changes",
-    description: `Apply a previewed license key change plan. Pass back the same changes you previewed, the planHash AND the taskToken from preview_license_changes \u2014 the request body IS the plan; the server never trusts a stored one. It re-resolves the changes, recomputes the hash, and refuses on mismatch. The task field is required but no longer needs to match what you previewed: the audit record is written from taskToken's embedded narrative, not from this field, so it always reflects what was actually reviewed at preview_license_changes. Every plan in this area requires a non-blank reviewOutcome. Pass acknowledgeDelicensing:true ONLY when the freshly re-resolved plan would leave zero license keys installed \u2014 omit it otherwise; if it is required and missing, the call is refused loud naming the field and the resulting count (this is an advisory acknowledgement, not a hard block: nothing in the underlying product itself forbids zero installed keys, and full de-licensing can be an intentional operator action). Result status is one of: "applied", "rolled-back" (something failed and every already-applied change was undone in reverse \u2014 an "add"'s inverse, removing the same key, is exact; a "remove"'s inverse, re-adding the same key, is real but NOT exact \u2014 a re-added key can land on a different cluster node than before, disclosed as a first-class \`advisory\` field on that change's rollback outcome, relay it to the human verbatim), "rollback-failed" (the server may be PARTIALLY CHANGED \u2014 escalate, do not retry, it names the specific key(s) left in an unknown state), or "conflict" (the plan drifted since preview \u2014 a key was installed/removed by someone else in between \u2014 nothing was applied). The response also carries the same first-class deLicensingWarning boolean preview_license_changes returns \u2014 here it is computed from a fresh installed-key count read immediately AFTER the apply resolves (ground truth, not a projection), so it reflects the real post-apply state even on a partial rollback or rollback-failed outcome. Omitted (not sent as false) if that follow-up read itself fails \u2014 the apply has already completed by that point, so this advisory-only field is simply left off rather than guessed. ` + ALREADY_INSTALLED_ADD_DISCLOSURE + " " + ENTERPRISE_GATE_DISCLOSURE + " Reading back a licensing changeset (get_changeset) is still enterprise-only like every other area's.",
+    description: `Apply a previewed license key change plan. Pass back the same changes you previewed, the planHash AND the taskToken from preview_license_changes \u2014 the request body IS the plan; the server never trusts a stored one. It re-resolves the changes, recomputes the hash, and refuses on mismatch. The task field is required but no longer needs to match what you previewed: the audit record is written from taskToken's embedded narrative, not from this field, so it always reflects what was actually reviewed at preview_license_changes. Every plan in this area requires a non-blank reviewOutcome. Pass acknowledgeDelicensing:true ONLY when the freshly re-resolved plan would leave zero license keys installed \u2014 omit it otherwise; if it is required and missing, the call is refused loud naming the field and the resulting count (this is an advisory acknowledgement, not a hard block: nothing in the underlying product itself forbids zero installed keys, and full de-licensing can be an intentional operator action). Result status is one of: "applied", "rolled-back" (something failed and every already-applied change was undone in reverse \u2014 an "add"'s inverse, removing the same key, is exact; a "remove"'s inverse, re-adding the same key, is real but NOT exact \u2014 a re-added key can land on a different cluster node than before, disclosed as a first-class \`advisory\` field on that change's rollback outcome, relay it to the human verbatim; an "update"'s inverse, updating back to the original key, IS exact \u2014 no advisory, since the same atomic replace primitive's cluster routing targets the exact node holding the current key's claim), "rollback-failed" (the server may be PARTIALLY CHANGED \u2014 escalate, do not retry, it names the specific key(s) left in an unknown state), or "conflict" (the plan drifted since preview \u2014 a key was installed/removed by someone else in between \u2014 nothing was applied). The response also carries the same first-class deLicensingWarning boolean preview_license_changes returns \u2014 here it is computed from a fresh installed-key count read immediately AFTER the apply resolves (ground truth, not a projection), so it reflects the real post-apply state even on a partial rollback or rollback-failed outcome. Omitted (not sent as false) if that follow-up read itself fails \u2014 the apply has already completed by that point, so this advisory-only field is simply left off rather than guessed. ` + ALREADY_INSTALLED_ADD_DISCLOSURE + " " + ENTERPRISE_GATE_DISCLOSURE + " Reading back a licensing changeset (get_changeset) is still enterprise-only like every other area's.",
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA11,
-        changes: CHANGES_SCHEMA11,
+        task: TASK_SCHEMA14,
+        changes: CHANGES_SCHEMA14,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_license_changes for this exact plan"
@@ -24317,7 +26034,7 @@ async function validateWholeListSubModels(deps, changes) {
     }
   }
 }
-var CHANGES_SCHEMA12 = {
+var CHANGES_SCHEMA15 = {
   type: "array",
   description: 'the proposed presentation sub-model updates; each entry names a subModel FIRST (one of the 16 catalogued sub-models, see get_presentation_settings), then a scope, then a partial-field spec object for THAT sub-model only. verb is always "update" \u2014 presentation sub-models are never created or destroyed, every one of the 16 always exists.',
   items: {
@@ -24343,7 +26060,7 @@ var CHANGES_SCHEMA12 = {
     required: ["verb", "subModel", "scope", "spec"]
   }
 };
-var TASK_SCHEMA12 = {
+var TASK_SCHEMA15 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -24383,7 +26100,7 @@ function makePreviewPresentationChangesTool(deps) {
     description: `Resolve a set of proposed presentation sub-model updates into a reviewable plan WITHOUT changing anything on the server. Response always has requiresAgentSignoff:true and requiresStorageBackup:true, unconditionally, for every plan in this area regardless of which sub-models are touched. You MUST pass the returned planHash to apply_presentation_changes. The hash covers the CURRENT value of every field the named sub-model's write would touch, not just the ones your spec names \u2014 a concurrent edit to any field inside the same sub-model perturbs the hash, even one your spec did not mention. Response always carries a taskToken bound to this exact planHash+task. You MUST pass both planHash and taskToken to apply_presentation_changes: the server re-resolves the plan and refuses with a conflict if anything drifted, and it writes the audit record from the task narrative embedded in taskToken \u2014 the one reviewed here \u2014 never from whatever task text apply_presentation_changes itself is called with. READ THIS BEFORE PREVIEWING A portalIntegration UPDATE WITH spec.tabs: this tool fetches a fresh read of the live tab list before ever sending your request, and refuses loud, naming the live count, if spec.tabs has fewer entries \u2014 the underlying write replaces the whole tab list at once, so a shorter array would silently drop every tab you did not include. THE SAME APPLIES TO A viewsheetToolbar UPDATE WITH spec.options: this tool fetches a fresh read of the live option list first, and refuses loud, naming the live count, if spec.options has fewer entries \u2014 the underlying write replaces the whole option list at once too. THE SAME APPLIES TO AN exportMenu UPDATE WITH spec.vsOptions: this tool fetches a fresh read of the live export-option list first, and refuses loud, naming the live count, if spec.vsOptions has fewer entries \u2014 the underlying write replaces the whole export-option list at once too. READ THIS BEFORE PREVIEWING A lookAndFeel UPDATE: logoFile/faviconFile/viewsheetFile names containing "/", "\\\\", or ".." are refused loud before the server is ever called \u2014 the underlying write path does not sanitize them. userformatFile is also a {name, content} object on lookAndFeel \u2014 a user-defined number/date format file, written to a fixed "userformat.xml" path; its name is never read by the write path, so no filename check applies to it. fontMapping/ai reject scope="organization" outright, naming the sub-model, rather than silently applying to the global layer (their underlying write silently drops an org-scoped change today). "reset" is not supported \u2014 there is no reset verb in this area (deferred pending stylebi#76341). ` + AMBIENT_SCOPE_DISCLOSURE + " " + NOT_ENTERPRISE_GATED_DISCLOSURE,
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA12, changes: CHANGES_SCHEMA12 },
+      properties: { task: TASK_SCHEMA15, changes: CHANGES_SCHEMA15 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -24404,8 +26121,8 @@ function makeApplyPresentationChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA12,
-        changes: CHANGES_SCHEMA12,
+        task: TASK_SCHEMA15,
+        changes: CHANGES_SCHEMA15,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_presentation_changes for this exact plan"
@@ -24482,10 +26199,186 @@ function makePresentationTools(deps) {
   ];
 }
 
+// src/tools/loggingTools.ts
+var TASK_SCHEMA16 = {
+  type: "string",
+  description: "a short description of what this change accomplishes; written into every audit record for the transaction"
+};
+var CHANGES_SCHEMA16 = {
+  type: "object",
+  description: `a SINGLE partial-field object shaped like LogSettingsModel \u2014 unlike every other area in this plugin, logging is ONE flat settings resource, not multiple independently addressable named units, so there is no subModel/unitType discriminator here. Include only the fields you intend to change: fileSettings.{maxLogSize, count}, fluentdSettings.{port, host, connectTimeout, securityEnabled, sharedKey, userAuthenticationEnabled, username, tlsEnabled, caCertificateFile, logViewUrl, orgAdminAccess}, outputToStd, detailLevel, provider ("file"|"fluentd"), and/or logLevels (an array of {context, name, orgName?, level}). A one-element array containing this same object is also accepted, mirroring every other area's array-or-single-object leniency; more than one array entry is refused loud. fileSettings.file is read-only/derived (no backing property) and is refused loud if present. fluentdSettings.password is refused for BOTH reading and writing \u2014 its name matches the secret pattern even though its value is plaintext, the identical treatment changeTools.ts's log.fluentd.security.password already gets; use Enterprise Manager directly for it. provider="fluentd" is refused loud on a non-Enterprise-licensed deployment (mirroring LogSettingService.java's own server-side gate, which the generic property write path underneath does NOT enforce on its own). Each logLevels entry translates to "log.level." + name (context="CATEGORY") or "log." + context + ".level." + name (any other context); level=null (or "clear"/"remove"/"none"/"unset", case-insensitive) REMOVES that override entirely \u2014 the literal string "OFF" is a REAL, distinct level (it silences the logger but the override still exists), never an alias for removal.`
+};
+async function getPropertyValue(deps, property) {
+  const response = await deps.wizClient.get(
+    `/v1/admin/properties/${encodeURIComponent(property)}`
+  );
+  return response?.currentValue ?? null;
+}
+function coerceLoggingReadValue(type, raw) {
+  if (raw === null || raw === void 0) {
+    return null;
+  }
+  if (type === "boolean") {
+    return String(raw).toLowerCase() === "true";
+  }
+  if (type === "number") {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+  return raw;
+}
+function setAtPath(obj, path2, value) {
+  const parts = path2.split(".");
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const existing = cur[parts[i]];
+    const next = existing !== null && typeof existing === "object" ? existing : {};
+    cur[parts[i]] = next;
+    cur = next;
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+var LOG_LEVELS_NOTE = 'Only overrides you already know the name of are inspectable today \u2014 use get_property with "log.level.<name>" for a CATEGORY (logger class) override, or "log.<CONTEXT>.level.<name>" (CONTEXT one of USER, GROUP, ROLE, ORGANIZATION, REPORT, DASHBOARD, QUERY, MODEL, WORKSHEET, SCHEDULE_TASK, ASSEMBLY, TABLE) for any other context. There is no way to enumerate every currently-set override without new StyleBI-side code (Tier 2, deliberately out of scope for this fix) \u2014 an empty array here means "not enumerable by this tool", NOT "no overrides are currently set".';
+var FILE_SETTINGS_FILE_NOTE = "Omitted \u2014 this field is derived from the server's current log file location (logManager.getBaseLogFile) and has no backing SreeEnv property at all, so it cannot be read through this tool (or written \u2014 see preview_logging_changes/apply_logging_changes).";
+var FLUENTD_PASSWORD_NOTE = "Omitted \u2014 refused for both reading and writing, because its name matches the secret pattern even though its value is plaintext (the identical treatment changeTools.ts's log.fluentd.security.password already gets). Use Enterprise Manager directly to inspect it.";
+async function readLoggingSettings(deps) {
+  const result = {};
+  await Promise.all(LOGGING_FIELD_MAP.map(async (field) => {
+    const raw = await getPropertyValue(deps, field.property);
+    setAtPath(result, field.path, coerceLoggingReadValue(field.type, raw));
+  }));
+  const [rawProvider, enterpriseLicensed] = await Promise.all([
+    getPropertyValue(deps, "log.provider"),
+    isEnterpriseLicensed(deps)
+  ]);
+  result.provider = rawProvider === "fluentd" && enterpriseLicensed ? "fluentd" : "file";
+  result.logLevels = [];
+  result.notes = {
+    "fileSettings.file": FILE_SETTINGS_FILE_NOTE,
+    "fluentdSettings.password": FLUENTD_PASSWORD_NOTE,
+    logLevels: LOG_LEVELS_NOTE
+  };
+  return result;
+}
+async function resolveLoggingPropertyChanges(deps, normalized) {
+  const changes = [...normalized.propertyChanges];
+  if (normalized.providerValue !== void 0) {
+    if (normalized.providerValue === "fluentd" && !await isEnterpriseLicensed(deps)) {
+      throw new Error(
+        `changes.provider: "fluentd" is refused \u2014 this deployment is not Enterprise-licensed. LogSettingService.setConfiguration refuses this exact combination server-side too (LicenseManager.isEnterprise() gate), but the generic property write path underneath does NOT enforce it on its own, so this tool reproduces the gate here rather than silently accepting a write that would leave the deployment in a state Enterprise Manager's own Logging page could never produce. Use provider="file", or license this deployment as Enterprise first.`
+      );
+    }
+    changes.push({ property: "log.provider", value: normalized.providerValue });
+  }
+  return changes;
+}
+function makeGetLoggingSettingsTool(deps) {
+  return {
+    name: "get_logging_settings",
+    description: `Read EM's Settings > Logging page in a structured, self-describing shape \u2014 fileSettings.{maxLogSize, count} (fileSettings.file is omitted, see notes), fluentdSettings.{port, host, connectTimeout, securityEnabled, sharedKey, userAuthenticationEnabled, username, tlsEnabled, caCertificateFile, logViewUrl, orgAdminAccess} (fluentdSettings.password is omitted, see notes), outputToStd, detailLevel, provider, and logLevels. Every field except provider/logLevels is an ordinary, fixed-name SreeEnv property read via the same generic mechanism get_property uses \u2014 this area has no dedicated StyleBI-side endpoint (Tier 1). fluentdSettings.sharedKey comes back null \u2014 masked on read, the same one of changeTools.ts's 7 secret-masked property names get_property/list_properties already withhold. provider is NEVER a raw property passthrough: it is computed as (the stored log.provider property equals "fluentd") AND (this deployment is Enterprise-licensed), mirroring LogbackUtil.isFluentdEnabled() exactly \u2014 on a non-Enterprise deployment this always reports "file" regardless of what the raw property currently holds, since the underlying product falls back to the file appender in that case too. logLevels is ALWAYS an empty array in this cut \u2014 enumerating every currently-set per-logger/per-context override needs new StyleBI-side code (Tier 2, deliberately out of scope for this fix); read notes.logLevels for how to check one override you already know the name of. Takes no arguments \u2014 logging settings are deployment-wide, not org-scoped.`,
+    inputSchema: { type: "object", properties: {} },
+    call: async () => {
+      await assertStyleBIRouting(deps.tokenStore);
+      return readLoggingSettings(deps);
+    }
+  };
+}
+function makePreviewLoggingChangesTool(deps) {
+  return {
+    name: "preview_logging_changes",
+    description: `Resolve a proposed logging-settings update into a reviewable plan WITHOUT changing anything on the server. Internally translates your LogSettingsModel-shaped changes into the same { property, value } pairs preview_changes itself would use, and delegates to the IDENTICAL /v1/admin/preview endpoint \u2014 so the returned plan's risk/snapshotScope/requiresAgentSignoff/requiresStorageBackup classification, planHash, and taskToken all behave exactly as they would for preview_changes given the same underlying property set (this area adds no separate risk model of its own). You MUST pass both the returned planHash and taskToken to apply_logging_changes. fileSettings.file is refused loud, naming the field, if present (read-only, no backing property). fluentdSettings.password is refused loud, naming the field, if present (secret-refused, matching changeTools.ts). provider="fluentd" is refused loud when this deployment is not Enterprise-licensed, before the server is ever called. A logLevels entry translates to "log.level." + name (context="CATEGORY") or "log." + context + ".level." + name (any other context); level=null (or "clear"/"remove"/"none"/"unset") REMOVES that override \u2014 the literal string "OFF" is a real, distinct level, never an alias for removal.`,
+    inputSchema: {
+      type: "object",
+      properties: { task: TASK_SCHEMA16, changes: CHANGES_SCHEMA16 },
+      required: ["task", "changes"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const task = requireTask(args?.task);
+      const normalized = normalizeLoggingChanges(args?.changes);
+      const propertyChanges = await resolveLoggingPropertyChanges(deps, normalized);
+      return deps.wizClient.post("/v1/admin/preview", { task, changes: propertyChanges });
+    }
+  };
+}
+function makeApplyLoggingChangesTool(deps) {
+  return {
+    name: "apply_logging_changes",
+    description: `Apply a previewed logging-settings change plan. Pass back the SAME changes you previewed plus the planHash AND the taskToken from preview_logging_changes \u2014 the request body IS the plan; the server never trusts a stored one. It re-resolves the changes, recomputes the hash, and refuses on mismatch. The task field is required but no longer needs to match what you previewed: the audit record is written from taskToken's embedded narrative, not from this field. If the previewed plan had requiresAgentSignoff:true you MUST also pass a non-blank reviewOutcome, or the apply is refused \u2014 identical to apply_changes. Result status is one of: "applied" (every change verified), "rolled-back" (something failed and every applied change was undone), "rollback-failed" (the server may be PARTIALLY CHANGED \u2014 escalate, do not retry), or "conflict" (the plan drifted since preview, nothing was applied). provider="fluentd" is re-checked against this deployment's Enterprise license at apply time too, not just at preview \u2014 refused loud, naming the field, if the deployment is not (or is no longer) Enterprise-licensed.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: TASK_SCHEMA16,
+        changes: CHANGES_SCHEMA16,
+        planHash: {
+          type: "string",
+          description: "the planHash returned by preview_logging_changes for this exact plan"
+        },
+        taskToken: {
+          type: "string",
+          description: "the taskToken returned by preview_logging_changes for this exact plan. The server writes the audit record from the task narrative embedded in this token, not from this call's own task field."
+        },
+        reviewOutcome: {
+          type: "string",
+          description: "the reviewer's verdict, recorded on every audit record. Required when the plan's requiresAgentSignoff is true."
+        }
+      },
+      required: ["task", "changes", "planHash", "taskToken"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      if (typeof args?.planHash !== "string" || args.planHash.trim() === "") {
+        throw new Error(
+          "planHash: required \u2014 the hash returned by preview_logging_changes for this plan. Call preview_logging_changes first."
+        );
+      }
+      if (typeof args?.taskToken !== "string" || args.taskToken.trim() === "") {
+        throw new Error(
+          "taskToken: required \u2014 the token returned by preview_logging_changes for this plan. Without it the server cannot verify which reviewed task narrative to audit. Call preview_logging_changes first. If preview_logging_changes's response contained no taskToken at all, this StyleBI deployment predates the pinned-audit contract and must be upgraded \u2014 do not retry."
+        );
+      }
+      const normalized = normalizeLoggingChanges(args.changes);
+      const propertyChanges = await resolveLoggingPropertyChanges(deps, normalized);
+      const body = {
+        task: requireTask(args.task),
+        changes: propertyChanges,
+        planHash: args.planHash.trim(),
+        taskToken: args.taskToken.trim()
+      };
+      const reviewOutcome = normalizeReviewOutcome(args.reviewOutcome);
+      if (reviewOutcome !== void 0) {
+        body.reviewOutcome = reviewOutcome;
+      }
+      try {
+        return await deps.wizClient.post("/v1/admin/apply", body);
+      } catch (err) {
+        const e = err;
+        if (e?.code === "HTTP_409") {
+          const detail = e.detail ?? {};
+          return {
+            status: "conflict",
+            error: typeof detail.error === "string" ? detail.error : e.message ?? "the plan no longer matches the planHash",
+            plan: detail.plan ?? null,
+            guidance: "The plan drifted between preview_logging_changes and apply_logging_changes \u2014 a property's current value changed, so the plan you reviewed is not the plan that would execute. NOTHING was applied. Show the returned `plan` to the user as a fresh diff, get confirmation again, then call preview_logging_changes again and use THAT response's planHash and taskToken."
+          };
+        }
+        throw err;
+      }
+    }
+  };
+}
+function makeLoggingTools(deps) {
+  return [
+    makeGetLoggingSettingsTool(deps),
+    makePreviewLoggingChangesTool(deps),
+    makeApplyLoggingChangesTool(deps)
+  ];
+}
+
 // src/tools/shapeTools.ts
 var AMBIENT_SCOPE_DISCLOSURE2 = `scope="organization" always means the CALLING PRINCIPAL'S OWN organization, resolved ambiently from the caller \u2014 there is no orgId argument anywhere in this area, matching Presentation's own convention. On a deployment that is NOT multi-tenant, "organization" and "global" resolve to the literal SAME shapes directory \u2014 this is the underlying server's own existing fallback behavior (a non-multi-tenant deployment's org-shapes directory falls back to the global one), not a bug in this tool, so seeing the same shapes under both scopes on such a deployment is expected, not a sign anything is broken.`;
 var NOT_ENTERPRISE_GATED_DISCLOSURE2 = "This area is NOT enterprise-gated \u2014 every custom-shapes tool works on a community-only deployment, the same as the rest of Presentation, even though it is served by its own, separate DataSpace-backed controller rather than a lookAndFeel field (apply_presentation_changes cannot touch shapes; there is no shape field on any of the 16 presentation sub-models).";
-var CHANGES_SCHEMA13 = {
+var CHANGES_SCHEMA17 = {
   type: "array",
   description: `the proposed shape uploads/deletes; each entry is { verb, scope, name, subPath?, content? }. verb is "upload" (create-or-overwrite \u2014 there is no separate non-overwriting create) or "delete". Every entry in this area is fully compensable: an upload's prior bytes (if any existed at that name) and a delete's removed bytes are both captured unconditionally, so there is no acknowledgeIrreversible* flag anywhere in this area.`,
   items: {
@@ -24515,7 +26408,7 @@ var CHANGES_SCHEMA13 = {
     required: ["verb", "scope", "name"]
   }
 };
-var TASK_SCHEMA13 = {
+var TASK_SCHEMA17 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -24555,7 +26448,7 @@ function makePreviewCustomShapeChangesTool(deps) {
     description: `Resolve a set of proposed Custom Shape uploads/deletes into a reviewable plan WITHOUT changing anything on the server. Response always has requiresAgentSignoff:true and requiresStorageBackup:true, unconditionally, for every entry \u2014 there is no low-risk verb in this area. Every entry is fully compensable by construction (an upload's prior bytes, if any existed at that name, and a delete's removed bytes are both captured unconditionally), so apply_custom_shape_changes never needs an acknowledgeIrreversible* flag \u2014 a stronger guarantee than Stored Assets/Presentation give their own destructive verbs. An "upload" that collides with an existing shape at that name is disclosed in the plan text as an overwrite, not refused \u2014 there is no separate non-overwriting create verb here. A "delete" targeting a name that does not exist is refused loud, not silently a no-op. Response always carries a planHash and a taskToken bound to it. You MUST pass both to apply_custom_shape_changes \u2014 the server re-resolves the plan and refuses with a conflict if anything drifted, and it writes the audit record from the task narrative embedded in taskToken, never from whatever task text apply_custom_shape_changes itself is called with. ` + AMBIENT_SCOPE_DISCLOSURE2 + " " + NOT_ENTERPRISE_GATED_DISCLOSURE2,
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA13, changes: CHANGES_SCHEMA13 },
+      properties: { task: TASK_SCHEMA17, changes: CHANGES_SCHEMA17 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -24574,8 +26467,8 @@ function makeApplyCustomShapeChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA13,
-        changes: CHANGES_SCHEMA13,
+        task: TASK_SCHEMA17,
+        changes: CHANGES_SCHEMA17,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_custom_shape_changes for this exact plan"
@@ -24645,9 +26538,9 @@ import fs4 from "fs";
 import os2 from "os";
 import nodePath3 from "path";
 var ENTERPRISE_GATE_NOTE = "This area requires the StyleBI enterprise module for every tool, reads included \u2014 a community-only deployment refuses cleanly (404) rather than returning a misleading empty list or silently no-op'd success, the same posture Licensing takes for its own area.";
-var CHANGES_SCHEMA14 = {
+var CHANGES_SCHEMA18 = {
   type: "array",
-  description: `the proposed theme creates/updates/deletes; each entry is { verb, id?, spec? }. List each id at most once. IMPORTANT: on verb="update", spec.name is unconditionally APPLIED when present \u2014 there is no separate rename flag \u2014 so resupply the theme's CURRENT name if you don't intend to rename it; omitting name entirely leaves it unchanged. spec.jar is a whole theme JAR archive (base64), NOT raw CSS text \u2014 to hand-edit individual CSS variables, use spec.portalCss/spec.emCss instead of building a jar; omitting jar/portalCss/emCss on an update leaves that content untouched (this is the one part of this area's "omitted means unchanged" contract that is NOT symmetric with name's own behavior).`,
+  description: `the proposed theme creates/updates/deletes; each entry is { verb, id?, spec? }. List each id at most once. IMPORTANT: on verb="update", spec.name is unconditionally APPLIED when present \u2014 there is no separate rename flag \u2014 so resupply the theme's CURRENT name if you don't intend to rename it; omitting name entirely leaves it unchanged. If the theme's id was auto-derived from its name (id equals name), renaming it also RELOCATES the id to the new name \u2014 do not cache the id across a rename; re-resolve by name via list_themes/get_theme, or read the preview's proposedValue / the apply result's advisory field, which both disclose the actual post-rename id. spec.jar is a whole theme JAR archive (base64), NOT raw CSS text \u2014 to hand-edit individual CSS variables, use spec.portalCss/spec.emCss instead of building a jar; omitting jar/portalCss/emCss on an update leaves that content untouched (this is the one part of this area's "omitted means unchanged" contract that is NOT symmetric with name's own behavior).`,
   items: {
     type: "object",
     properties: {
@@ -24657,7 +26550,7 @@ var CHANGES_SCHEMA14 = {
       },
       id: {
         type: "string",
-        description: `required for verb=delete/update, forbidden for verb=create (the id is derived server-side and may differ from any id you propose \u2014 the server de-conflicts a colliding id rather than refusing it; check the preview's proposedValue for the actual id that will be used). A bare, opaque, server-assigned id \u2014 never "name:orgId"-qualified the way an identity id can be.`
+        description: `required for verb=delete/update, forbidden for verb=create (the id is derived server-side and may differ from any id you propose \u2014 the server de-conflicts a colliding id rather than refusing it; check the preview's proposedValue for the actual id that will be used). A bare, opaque, server-assigned id \u2014 never "name:orgId"-qualified the way an identity id can be. On update, an id auto-derived from the theme's name is NOT stable across a rename \u2014 renaming relocates it to the new name, so do not cache this id past a rename; re-resolve by name via list_themes/get_theme, or check proposedValue/advisory for the actual post-rename id.`
       },
       spec: {
         type: "object",
@@ -24667,7 +26560,7 @@ var CHANGES_SCHEMA14 = {
     required: ["verb"]
   }
 };
-var TASK_SCHEMA14 = {
+var TASK_SCHEMA18 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -24704,7 +26597,7 @@ function makePreviewThemeChangesTool(deps) {
     description: `Resolve a set of proposed theme creates/updates/deletes into a reviewable plan WITHOUT changing anything on the server. Every verb in this area is always high risk (requiresAgentSignoff is always true) and always requires a Tier-2 storage backup (requiresStorageBackup is always true), the same unconditional treatment identities/permissions/licensing give their own areas. For a create, proposedValue shows the ACTUAL id the server will assign (themes silently de-conflict a colliding id rather than refusing it) and, if spec.jar was given, the REAL extracted CSS variables from that jar \u2014 not just an opaque "a jar was provided" placeholder \u2014 so review the preview's proposedValue rather than assuming your own proposed id/spec is exactly what gets applied. You MUST pass the returned planHash AND taskToken to apply_theme_changes: the server re-resolves the plan and refuses with a conflict if anything drifted, and it writes the audit record from the task narrative embedded in taskToken \u2014 the one reviewed here \u2014 never from whatever task text apply_theme_changes itself is called with. ${ENTERPRISE_GATE_NOTE}`,
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA14, changes: CHANGES_SCHEMA14 },
+      properties: { task: TASK_SCHEMA18, changes: CHANGES_SCHEMA18 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -24723,8 +26616,8 @@ function makeApplyThemeChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA14,
-        changes: CHANGES_SCHEMA14,
+        task: TASK_SCHEMA18,
+        changes: CHANGES_SCHEMA18,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_theme_changes for this exact plan"
@@ -24852,7 +26745,7 @@ function makeThemeTools(deps) {
 
 // src/tools/recycleBinTools.ts
 var SCOPE_DISCLOSURE = "IMPORTANT: this only recovers assets deleted through a HUMAN path (Enterprise Manager, Composer, Portal) \u2014 a delete made through apply_viewsheet_changes bypasses the recycle bin entirely and is not recoverable through this area at all.";
-var CHANGES_SCHEMA15 = {
+var CHANGES_SCHEMA19 = {
   type: "array",
   description: "the proposed restore/purge actions against already-recycled entries. There is no unitType discriminator here (unlike the Viewsheets area) \u2014 a recycle-bin entry's own type is intrinsic to the already-recycled item and the server resolves dispatch from path alone.",
   items: {
@@ -24874,7 +26767,7 @@ var CHANGES_SCHEMA15 = {
     required: ["verb", "path"]
   }
 };
-var TASK_SCHEMA15 = {
+var TASK_SCHEMA19 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -24916,7 +26809,7 @@ function makePreviewRecycleBinChangesTool(deps) {
     description: `Resolve a set of proposed restore/purge actions into a reviewable plan WITHOUT changing anything on the server. A plan containing any purge entry is risk:"high" and requiresAgentSignoff:true (irreversible, same treatment as a viewsheet delete elsewhere in this plugin) \u2014 a restore-only plan is risk:"low" UNLESS a restore entry's destination is already occupied, in which case (see overwrite above) the plan either refuses outright (overwrite not set) or is accepted at risk:"high" (overwrite:true \u2014 this permanently destroys the existing asset at the destination). requiresStorageBackup is always true for every verb in this area regardless of risk. There is no bulk "purge everything" verb \u2014 to empty the whole bin, compose a plan with a purge entry for every entry list_recycle_bin_entries returned. ` + SCOPE_DISCLOSURE,
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA15, changes: CHANGES_SCHEMA15 },
+      properties: { task: TASK_SCHEMA19, changes: CHANGES_SCHEMA19 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -24940,8 +26833,8 @@ function makeApplyRecycleBinChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA15,
-        changes: CHANGES_SCHEMA15,
+        task: TASK_SCHEMA19,
+        changes: CHANGES_SCHEMA19,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_recycle_bin_changes for this exact plan"
@@ -25014,7 +26907,7 @@ function makeRecycleBinTools(deps) {
 }
 
 // src/tools/mvTools.ts
-var CHANGES_SCHEMA16 = {
+var CHANGES_SCHEMA20 = {
   type: "array",
   description: `the proposed MV changes; each entry names verb FIRST. "create" and "set_cycle" both target candidate mv names produced by a prior analyze_mv run (via analysisId) \u2014 they are NOT interchangeable with an already-created mv's own name. "delete" targets an already-created mv by name directly, with no analysisId.`,
   items: {
@@ -25049,7 +26942,7 @@ var CHANGES_SCHEMA16 = {
     required: ["verb", "mvNames"]
   }
 };
-var TASK_SCHEMA16 = {
+var TASK_SCHEMA20 = {
   type: "string",
   description: "a short description of what this change accomplishes; written into every audit record for the transaction"
 };
@@ -25140,7 +27033,7 @@ function makePreviewMvChangesTool(deps) {
     description: "Resolve a set of proposed mv changes (create/set_cycle/delete) into a reviewable plan WITHOUT changing anything on the server. A create or delete entry is always high risk (requiresAgentSignoff:true for the whole plan); a plan containing ONLY set_cycle entries is low risk. requiresStorageBackup is true whenever the plan contains any create entry \u2014 a delete alone does not require it, since dispose is itself the rollback primitive create relies on. A create entry naming an mvName not present in its analysisId's own candidate list is refused loud, naming it \u2014 never silently resolved against the wrong analysis. You MUST pass the returned planHash AND taskToken to apply_mv_changes: the server writes the audit record from the task narrative embedded in taskToken, never from whatever task text apply_mv_changes itself is called with.",
     inputSchema: {
       type: "object",
-      properties: { task: TASK_SCHEMA16, changes: CHANGES_SCHEMA16 },
+      properties: { task: TASK_SCHEMA20, changes: CHANGES_SCHEMA20 },
       required: ["task", "changes"]
     },
     call: async (args) => {
@@ -25171,8 +27064,8 @@ function makeApplyMvChangesTool(deps) {
     inputSchema: {
       type: "object",
       properties: {
-        task: TASK_SCHEMA16,
-        changes: CHANGES_SCHEMA16,
+        task: TASK_SCHEMA20,
+        changes: CHANGES_SCHEMA20,
         planHash: {
           type: "string",
           description: "the planHash returned by preview_mv_changes for this exact plan"
@@ -25618,6 +27511,606 @@ function makeAssetTransferTools(deps) {
   ];
 }
 
+// src/tools/scriptLibraryTools.ts
+var SCOPE_DISCLOSURE2 = "IMPORTANT: this area is structural CRUD (rename/description/create/delete) only \u2014 it does NOT read or write a script's body text. To view or edit a script's actual code, use composer-chat's read_script_library_function/create_script_library_function/update_script_library_function instead; both tool sets operate on the same underlying Script Library asset from two different permission perspectives.";
+var CHANGES_SCHEMA21 = {
+  type: "array",
+  description: "the proposed create/rename/update/delete actions against Script Library entries. Each entry sets verb FIRST, then the fields that verb uses \u2014 an unused field for the resolved verb is refused loud rather than silently ignored.",
+  items: {
+    type: "object",
+    properties: {
+      verb: {
+        type: "string",
+        description: `"create" (new, empty-by-default script), "rename" (name -> newName), "update" (description only \u2014 this area never writes a script's body text), or "delete" ("remove" accepted as an alias for "delete").`
+      },
+      name: {
+        type: "string",
+        description: `required for every verb \u2014 the script's current name, exactly as returned by list_script_library/get_script_library_entry. For verb="create", the name to give the new script instead (refused loud if that name already exists).`
+      },
+      newName: {
+        type: "string",
+        description: 'verb="rename" only, required \u2014 the new name. Must differ from name and must not already exist.'
+      },
+      description: {
+        type: "string",
+        description: 'verb="create" (optional, defaults to blank) or verb="update" (required \u2014 pass "" to clear it, omitting the field entirely is refused as "nothing to change"). Not used for "rename"/"delete".'
+      },
+      text: {
+        type: "string",
+        description: `verb="create" only, optional (defaults to an empty script body \u2014 write the actual code afterward via composer-chat's update_script_library_function). Never used for "update" \u2014 this area cannot change a script's body text at all.`
+      },
+      force: {
+        type: "boolean",
+        description: `verb="delete" only, default false. If other assets still depend on this script, preview_script_library_changes refuses the plan naming them unless force:true is set. The script's own content is captured and restored if the deletion is later rolled back, but force:true does not change that anything calling it by name breaks for as long as the deletion stands.`
+      }
+    },
+    required: ["verb", "name"]
+  }
+};
+var TASK_SCHEMA21 = {
+  type: "string",
+  description: "a short description of what this change accomplishes; written into every audit record for the transaction"
+};
+function makeListScriptLibraryTool(deps) {
+  return {
+    name: "list_script_library",
+    description: "List every Script Library entry the caller holds ADMIN permission on (internal audit scripts are never listed). No arguments. Each entry is { name, description } \u2014 call get_script_library_entry for a specific entry's body text. " + SCOPE_DISCLOSURE2,
+    inputSchema: { type: "object", properties: {} },
+    call: async () => {
+      await assertStyleBIRouting(deps.tokenStore);
+      return deps.wizClient.get("/v1/admin/script-library");
+    }
+  };
+}
+function makeGetScriptLibraryEntryTool(deps) {
+  return {
+    name: "get_script_library_entry",
+    description: "Read one Script Library entry by name, including its body text. found:false is a normal answer, not an error \u2014 true both when no script exists by that name AND when one exists but is not visible to the caller. " + SCOPE_DISCLOSURE2,
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "the script's name, exactly as returned by list_script_library"
+        }
+      },
+      required: ["name"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      if (typeof args?.name !== "string" || args.name.trim() === "") {
+        throw new Error("name: required \u2014 the script's name, exactly as returned by list_script_library");
+      }
+      return deps.wizClient.get(`/v1/admin/script-library/entry?name=${encodeURIComponent(args.name.trim())}`);
+    }
+  };
+}
+function makePreviewScriptLibraryChangesTool(deps) {
+  return {
+    name: "preview_script_library_changes",
+    description: `Resolve a set of proposed create/rename/update/delete actions against the Script Library into a reviewable plan WITHOUT changing anything on the server. A plan containing any delete entry is risk:"high" and requiresAgentSignoff:true, unconditionally \u2014 a script's own content is fully recoverable via rollback, but this plugin cannot shrink the gap while the deletion stands to zero, so it is treated the same as any other irreversible-looking delete elsewhere in this plugin. create/rename/update are risk:"low". requiresStorageBackup is always true for every verb in this area. ` + SCOPE_DISCLOSURE2,
+    inputSchema: {
+      type: "object",
+      properties: { task: TASK_SCHEMA21, changes: CHANGES_SCHEMA21 },
+      required: ["task", "changes"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      return deps.wizClient.post("/v1/admin/script-library/preview", {
+        task: requireTask(args?.task),
+        changes: normalizeScriptLibraryChanges(args?.changes)
+      });
+    }
+  };
+}
+function makeApplyScriptLibraryChangesTool(deps) {
+  return {
+    name: "apply_script_library_changes",
+    description: 'Apply a previewed create/rename/update/delete plan against the Script Library. Pass back the SAME task and changes you previewed plus the planHash from preview_script_library_changes \u2014 the request body IS the plan; the server never trusts a stored one. reviewOutcome is required whenever the previewed plan had requiresAgentSignoff:true (any delete entry). acknowledgeIrreversibleDelete:true is required whenever changes contains any verb="delete" entry, unconditionally. Result status is one of: "applied", "rolled-back" (something failed and every undoable change was reverted \u2014 every verb here, including delete, has a real rollback), "rollback-failed" (the server may be PARTIALLY CHANGED \u2014 escalate, do not retry), or "conflict" (the plan drifted, nothing was applied). ' + SCOPE_DISCLOSURE2,
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: TASK_SCHEMA21,
+        changes: CHANGES_SCHEMA21,
+        planHash: {
+          type: "string",
+          description: "the planHash returned by preview_script_library_changes for this exact plan"
+        },
+        reviewOutcome: {
+          type: "string",
+          description: "the reviewer's verdict, recorded on every audit record. Required when the previewed plan's requiresAgentSignoff is true."
+        },
+        acknowledgeIrreversibleDelete: {
+          type: "boolean",
+          description: 'required and must be true whenever changes contains any verb="delete" entry. Omit entirely when the plan has no delete entry.'
+        }
+      },
+      required: ["task", "changes", "planHash"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      if (typeof args?.planHash !== "string" || args.planHash.trim() === "") {
+        throw new Error(
+          "planHash: required \u2014 the hash returned by preview_script_library_changes for this plan. Call preview_script_library_changes first."
+        );
+      }
+      const changes = normalizeScriptLibraryChanges(args.changes);
+      const task = requireTask(args.task);
+      const acknowledgeIrreversibleDelete = requireAcknowledgeIrreversibleScriptLibraryDelete(
+        changes,
+        args.acknowledgeIrreversibleDelete
+      );
+      const body = {
+        task,
+        changes,
+        planHash: args.planHash.trim()
+      };
+      const reviewOutcome = normalizeReviewOutcome(args.reviewOutcome);
+      if (reviewOutcome !== void 0) {
+        body.reviewOutcome = reviewOutcome;
+      }
+      if (acknowledgeIrreversibleDelete !== void 0) {
+        body.acknowledgeIrreversibleDelete = acknowledgeIrreversibleDelete;
+      }
+      try {
+        return await deps.wizClient.post("/v1/admin/script-library/apply", body);
+      } catch (err) {
+        const e = err;
+        if (e?.code === "HTTP_409") {
+          const detail = e.detail ?? {};
+          return {
+            status: "conflict",
+            error: typeof detail.error === "string" ? detail.error : e.message ?? "the plan no longer matches the planHash",
+            plan: detail.plan ?? null,
+            guidance: "The plan drifted between preview_script_library_changes and apply_script_library_changes \u2014 the named entry changed by someone else in between. NOTHING was applied. Show the returned `plan` to the user as a fresh diff, get confirmation again, then call apply_script_library_changes with the planHash from THAT plan."
+          };
+        }
+        throw err;
+      }
+    }
+  };
+}
+function makeScriptLibraryTools(deps) {
+  return [
+    makeListScriptLibraryTool(deps),
+    makeGetScriptLibraryEntryTool(deps),
+    makePreviewScriptLibraryChangesTool(deps),
+    makeApplyScriptLibraryChangesTool(deps)
+  ];
+}
+
+// src/tools/autoSaveRecycleBinTools.ts
+var SCOPE_DISCLOSURE3 = `This is the Auto Save Recycle Bin \u2014 crash/disconnect recovery copies of in-progress, never-saved viewsheet/worksheet edits (EM's "Auto Saved Asset Info" pane). It is a completely different feature from the ordinary Recycle Bin area (already-saved, then deleted assets) \u2014 use list_recycle_bin_entries/preview_recycle_bin_changes for a deleted asset instead.`;
+var CHANGES_SCHEMA22 = {
+  type: "array",
+  description: "the proposed restore/delete actions against Auto Save Recycle Bin entries.",
+  items: {
+    type: "object",
+    properties: {
+      verb: {
+        type: "string",
+        description: '"restore" (recreate the draft as a real, live asset at assetName, then remove the draft) or "delete" (permanently discard the draft \u2014 "remove"/"purge" accepted as aliases for "delete").'
+      },
+      id: {
+        type: "string",
+        description: "required \u2014 the entry's storage key, exactly as returned by list_autosave_entries/get_autosave_entry. Never hand-constructed."
+      },
+      assetName: {
+        type: "string",
+        description: `verb="restore" only, optional \u2014 the full destination asset path. Defaults to the draft's own original path (the path it was being edited at) when omitted.`
+      },
+      overwrite: {
+        type: "boolean",
+        description: 'verb="restore" only, default false. If something already occupies the destination assetName, overwrite:false makes preview_autosave_changes REFUSE THE PLAN LOUD, naming the occupied path. overwrite:true accepts the collision, but PERMANENTLY DESTROYS whatever currently occupies that path first. Not used for verb="delete" \u2014 refused loud if set there.'
+      }
+    },
+    required: ["verb", "id"]
+  }
+};
+var TASK_SCHEMA22 = {
+  type: "string",
+  description: "a short description of what this change accomplishes; written into every audit record for the transaction"
+};
+function makeListAutoSaveEntriesTool(deps) {
+  return {
+    name: "list_autosave_entries",
+    description: "List every Auto Save Recycle Bin entry the caller can see (owner-scoped entries are filtered by the same per-owner ADMIN permission check the Recycle Bin area uses; an owner-less/anonymous draft is visible to any site administrator). No arguments. " + SCOPE_DISCLOSURE3,
+    inputSchema: { type: "object", properties: {} },
+    call: async () => {
+      await assertStyleBIRouting(deps.tokenStore);
+      return deps.wizClient.get("/v1/admin/autosave-recyclebin");
+    }
+  };
+}
+function makeGetAutoSaveEntryTool(deps) {
+  return {
+    name: "get_autosave_entry",
+    description: "Read one Auto Save Recycle Bin entry by its storage key (id). found:false is a normal answer, not an error \u2014 true both when nothing is at that id AND when an entry exists there but is not visible to the caller. " + SCOPE_DISCLOSURE3,
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "the entry's storage key, exactly as returned by list_autosave_entries"
+        }
+      },
+      required: ["id"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const id = requireAutoSaveRecycleBinId(args?.id, "args");
+      return deps.wizClient.get(`/v1/admin/autosave-recyclebin/entry?id=${encodeURIComponent(id)}`);
+    }
+  };
+}
+function makePreviewAutoSaveChangesTool(deps) {
+  return {
+    name: "preview_autosave_changes",
+    description: `Resolve a set of proposed restore/delete actions into a reviewable plan WITHOUT changing anything on the server. A plan containing any delete entry is risk:"high" and requiresAgentSignoff:true, unconditionally \u2014 the draft's own content is fully recoverable via rollback, but this plugin cannot shrink the gap while the deletion stands to zero. A restore-only plan is risk:"low" UNLESS a restore entry's destination is already occupied, in which case the plan either refuses outright (overwrite not set) or is accepted at risk:"high" (overwrite:true \u2014 this permanently destroys the existing asset at the destination, and that destroyed asset itself has no live inverse even though the draft does). requiresStorageBackup is always true for every verb in this area. ` + SCOPE_DISCLOSURE3,
+    inputSchema: {
+      type: "object",
+      properties: { task: TASK_SCHEMA22, changes: CHANGES_SCHEMA22 },
+      required: ["task", "changes"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      return deps.wizClient.post("/v1/admin/autosave-recyclebin/preview", {
+        task: requireTask(args?.task),
+        changes: normalizeAutoSaveRecycleBinChanges(args?.changes)
+      });
+    }
+  };
+}
+async function resolveRestoreRisks2(deps, task, changes) {
+  const preview = await deps.wizClient.post("/v1/admin/autosave-recyclebin/preview", { task, changes });
+  const planChanges = preview?.changes;
+  return Array.isArray(planChanges) ? planChanges : void 0;
+}
+function makeApplyAutoSaveChangesTool(deps) {
+  return {
+    name: "apply_autosave_changes",
+    description: `Apply a previewed restore/delete plan. Pass back the SAME task and changes you previewed plus the planHash from preview_autosave_changes \u2014 the request body IS the plan; the server never trusts a stored one. reviewOutcome is required whenever the previewed plan had requiresAgentSignoff:true. acknowledgeIrreversibleDelete:true is required whenever the plan contains any delete entry, OR a restore entry whose destination collision was accepted via overwrite:true. Result status is one of: "applied", "rolled-back" (something failed and every undoable change was reverted \u2014 every verb here, including delete, has a real rollback; a restore's own rollback removes the newly-created live sheet and restores the draft, but if it destroyed an existing asset via overwrite:true that destroyed asset is gone regardless \u2014 relay that advisory to the human verbatim), "rollback-failed" (the server may be PARTIALLY CHANGED \u2014 escalate, do not retry), or "conflict" (the plan drifted, nothing was applied). ` + SCOPE_DISCLOSURE3,
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: TASK_SCHEMA22,
+        changes: CHANGES_SCHEMA22,
+        planHash: {
+          type: "string",
+          description: "the planHash returned by preview_autosave_changes for this exact plan"
+        },
+        reviewOutcome: {
+          type: "string",
+          description: "the reviewer's verdict, recorded on every audit record. Required when the previewed plan's requiresAgentSignoff is true."
+        },
+        acknowledgeIrreversibleDelete: {
+          type: "boolean",
+          description: 'required and must be true whenever changes contains any verb="delete" entry, OR a verb="restore" entry that preview_autosave_changes classified risk:"high" (a destination collision accepted via overwrite:true). Omit entirely when not required.'
+        }
+      },
+      required: ["task", "changes", "planHash"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      if (typeof args?.planHash !== "string" || args.planHash.trim() === "") {
+        throw new Error(
+          "planHash: required \u2014 the hash returned by preview_autosave_changes for this plan. Call preview_autosave_changes first."
+        );
+      }
+      const changes = normalizeAutoSaveRecycleBinChanges(args.changes);
+      const task = requireTask(args.task);
+      const hasDelete = changes.some((c) => c.verb === "delete");
+      const hasRestore = changes.some((c) => c.verb === "restore");
+      const planChanges = !hasDelete && hasRestore ? await resolveRestoreRisks2(deps, task, changes) : void 0;
+      const acknowledgeIrreversibleDelete = requireAcknowledgeIrreversibleAutoSaveRecycleBinDelete(
+        changes,
+        args.acknowledgeIrreversibleDelete,
+        planChanges
+      );
+      const body = {
+        task,
+        changes,
+        planHash: args.planHash.trim()
+      };
+      const reviewOutcome = normalizeReviewOutcome(args.reviewOutcome);
+      if (reviewOutcome !== void 0) {
+        body.reviewOutcome = reviewOutcome;
+      }
+      if (acknowledgeIrreversibleDelete !== void 0) {
+        body.acknowledgeIrreversibleDelete = acknowledgeIrreversibleDelete;
+      }
+      try {
+        return await deps.wizClient.post("/v1/admin/autosave-recyclebin/apply", body);
+      } catch (err) {
+        const e = err;
+        if (e?.code === "HTTP_409") {
+          const detail = e.detail ?? {};
+          return {
+            status: "conflict",
+            error: typeof detail.error === "string" ? detail.error : e.message ?? "the plan no longer matches the planHash",
+            plan: detail.plan ?? null,
+            guidance: "The plan drifted between preview_autosave_changes and apply_autosave_changes \u2014 the named entry, or its destination, changed by someone else in between. NOTHING was applied. Show the returned `plan` to the user as a fresh diff, get confirmation again, then call apply_autosave_changes with the planHash from THAT plan."
+          };
+        }
+        throw err;
+      }
+    }
+  };
+}
+function makeAutoSaveRecycleBinTools(deps) {
+  return [
+    makeListAutoSaveEntriesTool(deps),
+    makeGetAutoSaveEntryTool(deps),
+    makePreviewAutoSaveChangesTool(deps),
+    makeApplyAutoSaveChangesTool(deps)
+  ];
+}
+
+// src/tools/scheduleTransferTools.ts
+import fs6 from "fs";
+import os4 from "os";
+import nodePath5 from "path";
+import { readFile as readFile2, writeFile } from "fs/promises";
+function stringArray2(raw, label) {
+  if (raw === void 0 || raw === null) {
+    return [];
+  }
+  if (Array.isArray(raw) && raw.every((v) => typeof v === "string")) {
+    return raw;
+  }
+  throw new Error(`${label}: expected an array of strings, got ${JSON.stringify(raw)}`);
+}
+function requireTaskIds(raw) {
+  const taskIds = stringArray2(raw, "taskIds");
+  if (taskIds.length === 0) {
+    throw new Error(
+      "taskIds: at least one task id is required \u2014 as returned by list_schedule_tasks"
+    );
+  }
+  return taskIds;
+}
+function requireStagingToken2(args) {
+  const raw = args.stagingToken;
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new Error(
+      "stagingToken: required \u2014 the token returned by stage_schedule_task_import for this upload"
+    );
+  }
+  return raw.trim();
+}
+function normalizeImportChanges(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new Error(
+      "changes: at least one { taskId, overwrite? } entry is required \u2014 one per staged task you want to actually import"
+    );
+  }
+  return raw.map((entry, i) => {
+    const label = `changes[${i}]`;
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error(`${label}: expected an object, got ${typeof entry}`);
+    }
+    const e = entry;
+    if (typeof e.taskId !== "string" || e.taskId.trim() === "") {
+      throw new Error(`${label}.taskId: required non-blank string`);
+    }
+    if (e.overwrite !== void 0 && typeof e.overwrite !== "boolean") {
+      throw new Error(`${label}.overwrite: must be boolean when present`);
+    }
+    return { taskId: e.taskId.trim(), overwrite: e.overwrite === true };
+  });
+}
+function defaultExportDir2() {
+  return nodePath5.join(os4.homedir(), "Downloads");
+}
+function claimUniqueDest4(dir, fileName, fromPath) {
+  const ext = nodePath5.extname(fileName);
+  const base = fileName.slice(0, fileName.length - ext.length);
+  for (let i = 0; i < 1e3; i++) {
+    const candidate = i === 0 ? nodePath5.join(dir, fileName) : nodePath5.join(dir, `${base} (${i})${ext}`);
+    try {
+      fs6.linkSync(fromPath, candidate);
+      fs6.unlinkSync(fromPath);
+      return candidate;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+    }
+  }
+  throw new Error(
+    `export_schedule_tasks: could not find a free filename for '${fileName}' in '${dir}' after 1000 attempts.`
+  );
+}
+function makeExportScheduleTasksTool(deps) {
+  return {
+    name: "export_schedule_tasks",
+    description: `Export one or more schedule tasks (EM's own Settings > Schedule > Tasks "Export" dialog) to a local XML file \u2014 a single, bare, synchronous call: nothing on the server is mutated, so there is no preview/apply/planHash for this tool, matching export_repository_assets's own precedent. This is a SEPARATE feature from export_repository_assets \u2014 that area is scoped to viewsheet/worksheet only and silently excludes any schedule task under a selected folder; this tool is the one that actually exports a schedule task. Pass taskIds (as returned by list_schedule_tasks). includeDependencies (default false) also bundles every task the selected ones depend on (recursively) into the same file \u2014 check the response's missingDependencyIds when false: an import of this file elsewhere will fail for any selected task whose dependency isn't already present at the destination.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        taskIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "task ids as returned by list_schedule_tasks"
+        },
+        includeDependencies: {
+          type: "boolean",
+          description: "bundle every (recursively) required dependency task into the export file; default false"
+        },
+        savePath: {
+          type: "string",
+          description: "directory to save the XML file into (not a full file path). Defaults to this machine's Downloads folder."
+        }
+      },
+      required: ["taskIds"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const taskIds = requireTaskIds(args?.taskIds);
+      const includeDependencies = args?.includeDependencies === true;
+      const result = await deps.wizClient.post("/v1/admin/schedule/transfer/export", { taskIds, includeDependencies });
+      const dir = typeof args?.savePath === "string" && args.savePath.trim() !== "" ? args.savePath : defaultExportDir2();
+      const fileName = `schedule-tasks-${Date.now()}.xml`;
+      const provisionalDest = nodePath5.join(
+        dir,
+        `${fileName}-${Math.random().toString(36).slice(2)}.tmp`
+      );
+      await writeFile(provisionalDest, Buffer.from(result.xml, "base64"));
+      const filePath = claimUniqueDest4(dir, fileName, provisionalDest);
+      return {
+        filePath,
+        fileName: nodePath5.basename(filePath),
+        includedTaskIds: result.includedTaskIds,
+        includedDependencyIds: result.includedDependencyIds,
+        missingDependencyIds: result.missingDependencyIds
+      };
+    }
+  };
+}
+function makeStageScheduleTaskImportTool(deps) {
+  return {
+    name: "stage_schedule_task_import",
+    description: "Upload and parse a local schedule-task export XML file (e.g. one produced by export_schedule_tasks, or EM's own Export dialog), without changing anything on the server yet. Returns a stagingToken plus, per staged task, its taskId, dependency (comma- joined, empty if none), and existsAlready (whether a live task with that id is already on this server). The staged content is held in memory for 30 minutes of idle time \u2014 call preview_schedule_task_import well within that window. timeRangesInFile discloses how many <timeRange> definitions the file also contains \u2014 this tool does NOT import them (importing time ranges would silently replace every currently-configured Time Range with no per-item review); mention this to the user if the count is non-zero.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filePath: { type: "string", description: "local path to the schedule-task export XML file to upload" }
+      },
+      required: ["filePath"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      if (typeof args?.filePath !== "string" || args.filePath.trim() === "") {
+        throw new Error("filePath: required \u2014 a local path to the schedule-task export XML file to upload");
+      }
+      const bytes = await readFile2(args.filePath);
+      return deps.wizClient.post("/v1/admin/schedule/transfer/stage", {
+        xml: bytes.toString("base64")
+      });
+    }
+  };
+}
+function makePreviewScheduleTaskImportTool(deps) {
+  return {
+    name: "preview_schedule_task_import",
+    description: `Resolve a staged import's selected tasks into a reviewable plan. Writes nothing. Pass changes as one { taskId, overwrite? } entry per staged task you want to actually import \u2014 a staged task not listed here is simply not imported. A taskId that already exists live on this server is refused unless overwrite:true is set on that entry, in which case the existing task's conditions/actions are replaced ENTIRELY (classified risk:"high", and this whole plan's requiresAgentSignoff becomes true) \u2014 a brand-new taskId is risk:"low". You MUST pass the returned planHash AND taskToken to apply_schedule_task_import. This does NOT re-file an imported task into the folder its own export recorded \u2014 use preview_schedule_task_folder_changes separately for that \u2014 and does NOT import the file's own Time Range definitions (see stage_schedule_task_import's own description).`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: { type: "string", description: "a short description of what this import accomplishes" },
+        stagingToken: { type: "string", description: "the token returned by stage_schedule_task_import" },
+        changes: {
+          type: "array",
+          description: "one entry per staged task to actually import",
+          items: {
+            type: "object",
+            properties: {
+              taskId: { type: "string", description: "a taskId from stage_schedule_task_import's own tasks[]" },
+              overwrite: { type: "boolean", description: "must be true if taskId already exists live on this server" }
+            },
+            required: ["taskId"]
+          }
+        }
+      },
+      required: ["task", "stagingToken", "changes"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const task = requireTask(args?.task);
+      const stagingToken = requireStagingToken2(args ?? {});
+      const changes = normalizeImportChanges(args?.changes);
+      return deps.wizClient.post("/v1/admin/schedule/transfer/preview", { task, stagingToken, changes });
+    }
+  };
+}
+function makeApplyScheduleTaskImportTool(deps) {
+  return {
+    name: "apply_schedule_task_import",
+    description: `Apply a previewed schedule-task import. Pass back the SAME stagingToken/changes you previewed, plus the planHash AND taskToken from preview_schedule_task_import, and a reviewOutcome whenever the previewed plan's requiresAgentSignoff was true (any entry overwriting an existing task). If the plan contains any overwrite entry, you MUST also pass acknowledgeOverwrite:true \u2014 omitting it is refused loud. Each imported task's conditions/actions are sanitized the same way apply_schedule_task_changes' own create verb sanitizes them (e.g. a caller lacking the startTime/timeRange schedule permission gets those fields silently reset to what they're actually allowed) and have their action linkURIs rewritten to this server's own address \u2014 a task imported from a different environment's export never keeps pointing at the source server. Each entry is fully compensable: a create's rollback removes the task it created; an overwrite's rollback restores the original task exactly. Result status is "applied", "rolled-back" (something failed and every applied change was undone), or "rollback-failed" (the server may be PARTIALLY CHANGED \u2014 escalate to the operator, do not retry). A returned status of "conflict" means the plan drifted since preview (e.g. a taskId was created/deleted by someone else in between) \u2014 nothing was applied; re-preview and get fresh confirmation before retrying.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: { type: "string" },
+        stagingToken: { type: "string" },
+        changes: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              taskId: { type: "string" },
+              overwrite: { type: "boolean" }
+            },
+            required: ["taskId"]
+          }
+        },
+        planHash: { type: "string", description: "the planHash returned by preview_schedule_task_import" },
+        taskToken: { type: "string", description: "the taskToken returned by preview_schedule_task_import" },
+        reviewOutcome: { type: "string", description: "the reviewer's verdict, recorded on the audit record" },
+        acknowledgeOverwrite: {
+          type: "boolean",
+          description: "must be true whenever the previewed plan contains any overwrite entry"
+        }
+      },
+      required: ["task", "stagingToken", "changes", "planHash", "taskToken"]
+    },
+    call: async (args) => {
+      await assertStyleBIRouting(deps.tokenStore);
+      const task = requireTask(args?.task);
+      const stagingToken = requireStagingToken2(args ?? {});
+      const changes = normalizeImportChanges(args?.changes);
+      if (typeof args?.planHash !== "string" || args.planHash.trim() === "") {
+        throw new Error(
+          "planHash: required \u2014 the hash returned by preview_schedule_task_import for this plan. Call preview_schedule_task_import first."
+        );
+      }
+      if (typeof args?.taskToken !== "string" || args.taskToken.trim() === "") {
+        throw new Error(
+          "taskToken: required \u2014 the token returned by preview_schedule_task_import for this plan. Call preview_schedule_task_import first."
+        );
+      }
+      const anyOverwrite = changes.some((c) => c.overwrite === true);
+      if (anyOverwrite && args?.acknowledgeOverwrite !== true) {
+        throw new Error(
+          "acknowledgeOverwrite: required and must be true because this plan overwrites one or more existing schedule tasks \u2014 omitting it is refused loud rather than silently proceeding with a potentially destructive overwrite"
+        );
+      }
+      const reviewOutcome = normalizeReviewOutcome(args?.reviewOutcome);
+      const body = {
+        task,
+        stagingToken,
+        changes,
+        planHash: args.planHash.trim(),
+        taskToken: args.taskToken.trim(),
+        acknowledgeOverwrite: args?.acknowledgeOverwrite === true
+      };
+      if (reviewOutcome !== void 0) {
+        body.reviewOutcome = reviewOutcome;
+      }
+      try {
+        return await deps.wizClient.post("/v1/admin/schedule/transfer/apply", body);
+      } catch (err) {
+        const e = err;
+        if (e?.code === "HTTP_409") {
+          const detail = e.detail ?? {};
+          return {
+            status: "conflict",
+            error: typeof detail.error === "string" ? detail.error : e.message ?? "the plan no longer matches the planHash",
+            plan: detail.plan ?? null,
+            guidance: "The plan drifted between preview_schedule_task_import and apply_schedule_task_import \u2014 a task was created, deleted, or edited by someone else in between. NOTHING was applied. Show the returned `plan` to the user as a fresh diff, get confirmation again, then call apply_schedule_task_import with the planHash/taskToken from THAT plan."
+          };
+        }
+        throw err;
+      }
+    }
+  };
+}
+function makeScheduleTransferTools(deps) {
+  return [
+    makeExportScheduleTasksTool(deps),
+    makeStageScheduleTaskImportTool(deps),
+    makePreviewScheduleTaskImportTool(deps),
+    makeApplyScheduleTaskImportTool(deps)
+  ];
+}
+
 // src/server.ts
 function createServer(overrides = {}) {
   const tokenStore = overrides.tokenStore ?? new TokenStore(defaultCredentialsPath("admin-chat"));
@@ -25633,11 +28126,15 @@ function createServer(overrides = {}) {
     ...makeChangeTools(adminDeps),
     ...makeAuditTools(adminDeps),
     ...makeScheduleTools(adminDeps),
+    ...makeScheduleFolderTools(adminDeps),
+    ...makeScheduleSettingsTools(adminDeps),
     ...makePermissionTools(adminDeps),
     ...makeIdentityTools(adminDeps),
+    ...makeOrganizationTools(adminDeps),
     ...makeProviderTools(adminDeps),
     ...makeDataSourceTools(adminDeps),
     ...makeClusterTools(adminDeps),
+    ...makeSchedulerStatusTools(adminDeps),
     ...makeRepositoryMaintenanceTools(adminDeps),
     ...makeStoredAssetTools(adminDeps),
     ...makePluginManagementTools(adminDeps),
@@ -25646,11 +28143,15 @@ function createServer(overrides = {}) {
     ...makeDashboardTools(adminDeps),
     ...makeLicensingTools(adminDeps),
     ...makePresentationTools(adminDeps),
+    ...makeLoggingTools(adminDeps),
     ...makeShapeTools(adminDeps),
     ...makeThemeTools(adminDeps),
     ...makeRecycleBinTools(adminDeps),
     ...makeMvTools(adminDeps),
     ...makeAssetTransferTools(adminDeps),
+    ...makeScriptLibraryTools(adminDeps),
+    ...makeAutoSaveRecycleBinTools(adminDeps),
+    ...makeScheduleTransferTools(adminDeps),
     // Documentation search: the agent has no product source in normal use, so this is how a
     // natural-language task becomes a property name. Uses the shared assertDocsSearchRouting
     // rather than this file's own assertStyleBIRouting purely because the guard is shared with

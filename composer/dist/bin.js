@@ -17270,7 +17270,7 @@ function findLegacyWorkspaceSession(file, runtimeType) {
 var StateStore = class {
   constructor(filePath, processInstanceId) {
     this.filePath = filePath;
-    this.processInstanceId = processInstanceId ?? crypto3.randomUUID();
+    this.processInstanceId = processInstanceId ?? (process.ppid ? String(process.ppid) : crypto3.randomUUID());
   }
   /**
    * In-memory only — never persisted. Lets a single process tell "the session in this slot is
@@ -17280,12 +17280,22 @@ var StateStore = class {
    */
   ownSessions = /* @__PURE__ */ new Map();
   /**
-   * One id per `StateStore` instance (one per OS process — `server.ts` constructs exactly one at
-   * `createServer()` startup), minted fresh unless a caller supplies one (tests modeling two
-   * processes sharing one file construct two instances and get two distinct ids for free without
-   * needing to pass anything). Never read from or written to the state file directly by this
-   * constructor — it only ever reaches disk riding along on an {@link AgentSession} record via
-   * {@link setSheetSession}.
+   * One id per *logical* MCP client session, not per OS process. `server.ts` constructs exactly
+   * one `StateStore` at `createServer()` startup, unless a caller supplies an id explicitly (tests
+   * modeling two genuinely unrelated processes sharing one file pass distinct ids for exactly that
+   * reason). Defaults to `process.ppid` — the parent (the Claude Code host) that spawned this MCP
+   * stdio subprocess — rather than a fresh random id, because the host restarting just this child
+   * process (an `/mcp` reconnect, a dist/bin.js reload, a harness respawn) is common and must not
+   * orphan a session this same logical connection created moments earlier: a random id would
+   * change on every such restart, and {@link resolveSheetSession}'s `gateToOwnProcess` check would
+   * then reject the connection's own pool entry as "foreign," even though nothing but this one
+   * child process ever changed. `process.ppid` stays stable across exactly that kind of respawn
+   * (the parent host process itself doesn't restart) while still differing across genuinely
+   * separate sessions, each its own top-level OS process with its own parent — which is what
+   * WBS-031's cross-session protection actually needs to key on. Falls back to `crypto.randomUUID()`
+   * only if `process.ppid` is unavailable (falsy on some unusual host/platform combination). Never
+   * read from or written to the state file directly by this constructor — it only ever reaches disk
+   * riding along on an {@link AgentSession} record via {@link setSheetSession}.
    */
   processInstanceId;
   async read() {
@@ -18657,7 +18667,7 @@ function misroutingUrl(creds) {
 // src/tools/viewsheetTools.ts
 import fs4 from "fs";
 import os from "os";
-import nodePath2 from "path";
+import nodePath3 from "path";
 
 // src/tools/dynamicComponentRef.ts
 var DYNAMIC_REFERENCE_CAPABLE_TYPES = /* @__PURE__ */ new Set([
@@ -18668,6 +18678,7 @@ var DYNAMIC_REFERENCE_CAPABLE_TYPES = /* @__PURE__ */ new Set([
   "spinner",
   "textinput"
 ]);
+var MULTI_VALUED_DYNAMIC_REFERENCE_TYPES = /* @__PURE__ */ new Set(["checkbox"]);
 function extractComponentReference(value, fieldLabel) {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -18715,7 +18726,7 @@ function nearestMatch(name, candidates) {
   }
   return bestDistance <= 3 ? best : void 0;
 }
-function requireResolvableComponentReference(name, fieldLabel, assemblies) {
+function requireResolvableComponentReference(name, fieldLabel, assemblies, opts) {
   const match = assemblies.find((a) => a.name === name);
   if (!match) {
     const suggestion = nearestMatch(name, assemblies.map((a) => a.name));
@@ -18727,6 +18738,11 @@ function requireResolvableComponentReference(name, fieldLabel, assemblies) {
   if (!DYNAMIC_REFERENCE_CAPABLE_TYPES.has(type)) {
     throw new Error(
       `${fieldLabel} references "$(${name})", but '${name}' is a ${match.type}, not a Form component with a live value StyleBI can read a dynamic reference from. Only CheckBox, ComboBox, RadioButton, Slider, Spinner, and TextInput assemblies qualify.`
+    );
+  }
+  if (MULTI_VALUED_DYNAMIC_REFERENCE_TYPES.has(type) && !opts?.allowMultiValued) {
+    throw new Error(
+      `${fieldLabel} references "$(${name})", but '${name}' is a ${match.type} \u2014 its value is always an array, even with a single item selected. This binding target takes a single value, and a CheckBox's value never propagates into it on refresh: the binding would save cleanly and then silently never update, with no error. Use a single-valued control instead (ComboBox, RadioButton, Slider, Spinner, TextInput), or drive this from a viewsheetOnLoad script, e.g. Target.visible = ${match.name}.selectedObjects.length > 0;`
     );
   }
 }
@@ -18805,6 +18821,26 @@ function setsFacetGridTrue(properties) {
     ([key, value]) => FACET_GRID_KEYS.has(key.trim().toLowerCase()) && isTruthy(value)
   );
 }
+var BAR_CORNER_RADIUS_KEYS = /* @__PURE__ */ new Set([
+  "barcornerradius",
+  "chartadvancedpanemodel.chartplotoptionspanemodel.barcornerradius"
+]);
+var BAR_CORNER_RADIUS_MIN = 0;
+var BAR_CORNER_RADIUS_MAX = 0.5;
+function refuseOutOfRangeBarCornerRadius(assembly, properties) {
+  const key = findKey2(properties, BAR_CORNER_RADIUS_KEYS);
+  if (!key) return;
+  const value = toNumber(properties[key]);
+  if (value === void 0) return;
+  if (value < BAR_CORNER_RADIUS_MIN || value > BAR_CORNER_RADIUS_MAX) {
+    throw new Error(
+      `barCornerRadius must be between ${BAR_CORNER_RADIUS_MIN} and ${BAR_CORNER_RADIUS_MAX} on '${assembly}' (got ${value}) \u2014 a corner radius can't exceed half the bar's width, so a higher value is geometrically meaningless. Matches the Composer UI's own range, which refuses to save outside it.`
+    );
+  }
+}
+var TIP_ALPHA_KEYS = /* @__PURE__ */ new Set(["tipalpha", "chartgeneralpanemodel.tippanemodel.alpha"]);
+var TIP_ALPHA_MIN = 0;
+var TIP_ALPHA_MAX = 100;
 var HEIGHT_KEYS = /* @__PURE__ */ new Set(["height", "selectiongeneralpanemodel.sizepositionpanemodel.height"]);
 var SHOW_TYPE_KEYS = /* @__PURE__ */ new Set(["showtype", "selectiongeneralpanemodel.showtype"]);
 var DROPDOWN_SELECTION_ASSEMBLY_TYPES = /* @__PURE__ */ new Set(["selectionlist", "selectiontree"]);
@@ -18839,6 +18875,50 @@ async function refuseInertDropdownHeightWrite(deps, token, assembly, properties)
     `height is not settable on '${assembly}' while showType is dropdown \u2014 the server derives it from titleHeight in dropdown mode and this write would be silently discarded. Switch showType to list (0) first, or omit height.`
   );
 }
+var LIST_VALUES_ASSEMBLY_PREFIXES = {
+  checkbox: "checkboxGeneralPaneModel",
+  combobox: "comboboxGeneralPaneModel",
+  radiobutton: "radioButtonGeneralPaneModel"
+};
+var COMBO_BOX_EDITOR_SUFFIX = "listValuesPaneModel.comboBoxEditorModel";
+var LIST_VALUES_EDITOR_SUFFIX = `${COMBO_BOX_EDITOR_SUFFIX}.selectionListDialogModel.selectionListEditorModel`;
+function listValuesFieldKeys(shortName, fieldSuffix) {
+  const rawPaths = Object.values(LIST_VALUES_ASSEMBLY_PREFIXES).map((prefix) => `${prefix}.${fieldSuffix}`.toLowerCase());
+  return /* @__PURE__ */ new Set([shortName, ...rawPaths]);
+}
+var COLUMN_KEYS = listValuesFieldKeys("column", `${LIST_VALUES_EDITOR_SUFFIX}.column`);
+var VALUE_KEYS = listValuesFieldKeys("value", `${LIST_VALUES_EDITOR_SUFFIX}.value`);
+var TABLE_KEYS = listValuesFieldKeys("table", `${LIST_VALUES_EDITOR_SUFFIX}.table`);
+var QUERY_KEYS = listValuesFieldKeys("query", `${COMBO_BOX_EDITOR_SUFFIX}.query`);
+async function mirrorListValuesColumnIntoValue(deps, token, assembly, properties) {
+  const columnKey = findKey2(properties, COLUMN_KEYS);
+  if (!columnKey) return;
+  const listing = await deps.wizClient.get(
+    path3(token, `properties/list?assembly=${encodeURIComponent(assembly)}`)
+  );
+  const assemblyType = (listing?.assemblyType ?? "").trim().toLowerCase();
+  const prefix = LIST_VALUES_ASSEMBLY_PREFIXES[assemblyType];
+  if (!prefix) return;
+  if (findKey2(properties, VALUE_KEYS) !== void 0) return;
+  properties[`${prefix}.${LIST_VALUES_EDITOR_SUFFIX}.value`] = properties[columnKey];
+}
+async function refuseComboBoxListValuesWithoutQuery(deps, token, assembly, properties) {
+  const tableKey = findKey2(properties, TABLE_KEYS);
+  const columnKey = findKey2(properties, COLUMN_KEYS);
+  if (!tableKey && !columnKey) return;
+  const listing = await deps.wizClient.get(
+    path3(token, `properties/list?assembly=${encodeURIComponent(assembly)}`)
+  );
+  const assemblyType = (listing?.assemblyType ?? "").trim().toLowerCase();
+  if (assemblyType !== "combobox") return;
+  const queryKey = findKey2(properties, QUERY_KEYS);
+  const currentByName = new Map((listing?.properties ?? []).map((p) => [p.name, p.value]));
+  const effectiveQuery = queryKey !== void 0 ? properties[queryKey] : currentByName.get("query");
+  if (isTruthy(effectiveQuery)) return;
+  throw new Error(
+    `table/column on '${assembly}' requires query:true in the same patch (or already set) \u2014 a ComboBox only applies its List Values binding when query mode is on; otherwise the server discards the whole binding, including table. Add query:true to this patch.`
+  );
+}
 async function resolveDynamicPropertyRefs(deps, token, properties) {
   const refs = /* @__PURE__ */ new Map();
   for (const [key, value] of Object.entries(properties)) {
@@ -18861,6 +18941,48 @@ async function resolveDynamicPropertyRefs(deps, token, properties) {
     );
   }
 }
+var CHART_PLOT_OPTIONS_PREFIX = "chartAdvancedPaneModel.chartPlotOptionsPaneModel.";
+function chartApplicabilityEntry(shortName) {
+  const rawPath = `${CHART_PLOT_OPTIONS_PREFIX}${shortName}`;
+  return {
+    shortName,
+    keys: /* @__PURE__ */ new Set([shortName.toLowerCase(), rawPath.toLowerCase()]),
+    companion: `${rawPath}Visible`
+  };
+}
+var CHART_APPLICABILITY_COMPANIONS = [
+  "borderColor",
+  "barCornerRadius",
+  "barRoundAllCorners",
+  "explodedPie",
+  "polygonColor",
+  "mapEmptyColor",
+  "webMap",
+  "showPoints",
+  "fillGapWithDash",
+  "paretoLineColor",
+  "includeParentLabels",
+  "applyAestheticsToSource"
+].map(chartApplicabilityEntry);
+function getByPath(model, dottedPath) {
+  return dottedPath.split(".").reduce((node, segment) => {
+    if (node === null || typeof node !== "object") return void 0;
+    return node[segment];
+  }, model);
+}
+async function chartApplicabilityWarning(deps, token, assembly, properties) {
+  const writtenKeys = Object.keys(properties).map((key) => key.trim().toLowerCase());
+  const written = CHART_APPLICABILITY_COMPANIONS.filter(
+    (entry) => writtenKeys.some((key) => entry.keys.has(key))
+  );
+  if (written.length === 0) return void 0;
+  const raw = await deps.wizClient.get(
+    path3(token, `properties?assembly=${encodeURIComponent(assembly)}&raw=true`)
+  );
+  const inapplicable = written.filter((entry) => getByPath(raw, entry.companion) === false).map((entry) => entry.shortName);
+  if (inapplicable.length === 0) return void 0;
+  return `${inapplicable.join(", ")} ${inapplicable.length === 1 ? "has" : "have"} no visible effect: '${assembly}'s current chart type doesn't support ${inapplicable.length === 1 ? "it" : "them"}. The write still applies and persists \u2014 it may take effect if the chart type changes later.`;
+}
 function makeSetAssemblyPropertiesTool(deps) {
   return {
     name: "set_assembly_properties",
@@ -18878,7 +19000,17 @@ Values are forgiving where the intent is clear: "true" for a boolean, "100" for 
 
 'height' on a SelectionList/SelectionTree is refused (not silently dropped) while its effective showType is dropdown (1) \u2014 the server derives height from titleHeight in that mode and would discard the write. Switch showType to list (0) first, or omit height.
 
-**A property value may also be \`"$(ComponentName)"\`** \u2014 at minimum this works for 'visible' and 'enabled' \u2014 binding the property to a CheckBox, ComboBox, RadioButton, Slider, Spinner, or TextInput assembly's live value instead of a fixed literal, so flipping that component flips the property. Example: {enabled: "$(EnableToggle)"} keeps this assembly's enabled state tracking EnableToggle's value with no Condition and no worksheet variable involved. The mechanism generalizes to any other unconstrained String property this build accepts (get_assembly_properties/list_assembly_properties report the current value either way), but this call does not claim which ones beyond 'visible'/'enabled'. \`ComponentName\` must name an existing assembly of one of those six types \u2014 a typo, a deleted assembly, or a reference to a non-input assembly is refused rather than saved and silently rendered wrong (e.g. always Hide).
+'barCornerRadius' on a chart is refused outside 0-0.5 (matching the Composer UI's own range, which blocks saving outside it) \u2014 a radius can't exceed half the bar's width, so a higher value is geometrically meaningless.
+
+'tipAlpha' on a chart may be clamped to 0-100 (an opacity percentage) if set outside that range, matching the Composer UI's own tooltip-alpha control \u2014 the response reads back and discloses the actual stored value whenever it differs from what was requested.
+
+A chart property whose write persists but has no visible effect for the chart's current type (e.g. 'borderColor' on a type that doesn't render one) still applies \u2014 the response carries a warning naming it, the same disclosure 'facetGrid' gets above.
+
+A chart/crosstab's 'hierarchyPropertyPaneModel.dimensions' \u2014 its custom drill hierarchy \u2014 looks reachable as a raw dotted path but is refused outright: its entries are structured objects this tool cannot build from JSON. Use list_hierarchy_dimensions / add_hierarchy_dimension / remove_hierarchy_dimension instead.
+
+On a CheckBox/ComboBox/RadioButton's List Values, setting 'column' without 'value' has 'value' mirrored from 'column' automatically (the common single-column case) unless you already set 'value' yourself. On a ComboBox specifically, 'table'/'column' are refused unless 'query:true' is also set (in this patch or already on the assembly) \u2014 otherwise the server discards the whole binding, table included.
+
+**A property value may also be \`"$(ComponentName)"\`** \u2014 at minimum this works for 'visible' and 'enabled' \u2014 binding the property to a ComboBox, RadioButton, Slider, Spinner, or TextInput assembly's live value instead of a fixed literal, so flipping that component flips the property. Example: {enabled: "$(EnableToggle)"} keeps this assembly's enabled state tracking EnableToggle's value with no Condition and no worksheet variable involved. The mechanism generalizes to any other unconstrained String property this build accepts (get_assembly_properties/list_assembly_properties report the current value either way), but this call does not claim which ones beyond 'visible'/'enabled'. \`ComponentName\` must name an existing assembly of one of those five types \u2014 a typo, a deleted assembly, or a reference to a non-input assembly is refused rather than saved and silently rendered wrong (e.g. always Hide). **A CheckBox is refused here too, on purpose** \u2014 it's a real Form component StyleBI can read a value from, but that value is always an array (even with one item selected) and never propagates into a single-valued property on refresh: the write would look accepted and then silently never update. Drive a CheckBox-controlled property from a viewsheetOnLoad script instead, e.g. \`Chart1.visible = CheckBox1.selectedObjects.length > 0;\`.
 
 One call is one undo checkpoint. Verify with get_viewsheet_image.`,
     inputSchema: {
@@ -18908,17 +19040,42 @@ One call is one undo checkpoint. Verify with get_viewsheet_image.`,
       }
       const token = await requireSession(deps);
       await resolveDynamicPropertyRefs(deps, token, properties);
+      refuseOutOfRangeBarCornerRadius(assembly, properties);
       await refuseInertDropdownHeightWrite(deps, token, assembly, properties);
+      await mirrorListValuesColumnIntoValue(deps, token, assembly, properties);
+      await refuseComboBoxListValuesWithoutQuery(deps, token, assembly, properties);
+      const tipAlphaKey = findKey2(properties, TIP_ALPHA_KEYS);
+      const requestedTipAlpha = tipAlphaKey !== void 0 ? toNumber(properties[tipAlphaKey]) : void 0;
+      const tipAlphaOutOfRange = requestedTipAlpha !== void 0 && (requestedTipAlpha < TIP_ALPHA_MIN || requestedTipAlpha > TIP_ALPHA_MAX);
       await deps.wizClient.post(path3(token, "properties"), { assembly, properties });
-      let warning;
+      const warnings = [];
       if (setsFacetGridTrue(properties)) {
         const current = await deps.wizClient.get(
           path3(token, `properties?assembly=${encodeURIComponent(assembly)}`)
         );
         if (current?.facetGridVisible === false) {
-          warning = `facetGrid has no visible effect: '${assembly}' is not currently faceted. Facet-grid lines only appear at panel boundaries in a trellis \u2014 use set_chart_shelf to bind 2+ dimensions to the same x or y shelf first.`;
+          warnings.push(`facetGrid has no visible effect: '${assembly}' is not currently faceted. Facet-grid lines only appear at panel boundaries in a trellis \u2014 use set_chart_shelf to bind 2+ dimensions to the same x or y shelf first.`);
         }
       }
+      if (tipAlphaOutOfRange) {
+        const current = await deps.wizClient.get(
+          path3(token, `properties?assembly=${encodeURIComponent(assembly)}`)
+        );
+        const actualTipAlpha = toNumber(current?.tipAlpha);
+        if (actualTipAlpha !== void 0 && actualTipAlpha !== requestedTipAlpha) {
+          warnings.push(
+            `tipAlpha stored as ${actualTipAlpha} (valid range is ${TIP_ALPHA_MIN}-${TIP_ALPHA_MAX}) \u2014 requested ${requestedTipAlpha}.`
+          );
+        }
+      }
+      const applicabilityWarning = await chartApplicabilityWarning(
+        deps,
+        token,
+        assembly,
+        properties
+      );
+      if (applicabilityWarning) warnings.push(applicabilityWarning);
+      const warning = warnings.length > 0 ? warnings.join(" ") : void 0;
       return {
         ok: true,
         summary: `Set ${keys.length} propert${keys.length === 1 ? "y" : "ies"} on ${assembly} (${keys.join(", ")}). Verify with get_viewsheet_image.` + (warning ? ` ${warning}` : ""),
@@ -18951,6 +19108,13 @@ async function requireSession2(deps) {
 }
 function path4(token, suffix) {
   return `/v1/agent/binding/${encodeURIComponent(token)}/${suffix}`;
+}
+var PARTIAL_STATE_ON_ERROR_MARKER = /one undo step covers/i;
+async function undoBindingSession(deps, token) {
+  await deps.wizClient.post(
+    `/v1/agent/${runtimeTypeFor("binding")}/${encodeURIComponent(token)}/undo`,
+    {}
+  );
 }
 async function requireBindingSession(deps) {
   const session = await deps.stateStore.getSheetSession(
@@ -19309,7 +19473,8 @@ function nameHighlightFields(binding) {
 }
 var CHART_SHELVES = ["x", "y", "group"];
 var ONE_SOURCE_NOTE = "\n\n**Every field on a chart comes from ONE source table.** list_bindable_fields groups columns by table and marks the chart's current one; a column from any other table is refused, because repointing the chart would delete the fields already bound to it.";
-var DYNAMIC_COLUMN_REFERENCE_NOTE = "\n\n**`column` also accepts `\"$(ComponentName)\"`** \u2014 binds the field to a CheckBox, ComboBox, RadioButton, Slider, Spinner, or TextInput assembly's live value instead of a literal column, so flipping that component swaps which column this shelf reads. Example: a RadioButton with embedded values 'Quantity Purchased'/'Total' bound via {column:'$(RadioButton1)', type:'measure'} on a chart's y shelf swaps the measure shown when the RadioButton is pressed. `ComponentName` must name an existing assembly of one of those six types \u2014 read_viewsheet_model lists assembly names and types; a typo, a deleted assembly, or a reference to a non-input assembly (a chart, a table, \u2026) is refused rather than saved and silently rendered wrong.";
+var DYNAMIC_COLUMN_REFERENCE_NOTE = "\n\n**`column` also accepts `\"$(ComponentName)\"`** \u2014 binds the field to a CheckBox, ComboBox, RadioButton, Slider, Spinner, or TextInput assembly's live value instead of a literal column, so flipping that component swaps which column this shelf reads. Example: a RadioButton with embedded values 'Quantity Purchased'/'Total' bound via {column:'$(RadioButton1)', type:'measure'} on a chart's y shelf swaps the measure shown when the RadioButton is pressed. **A CheckBox is different, not weaker**: unlike the other five (single-valued) controls, its value is always an array, even with one item selected \u2014 and since a shelf's `fields` is itself a list, StyleBI genuinely fans one CheckBox-bound field out into one bound column per currently-selected item (confirmed live: a y-shelf measure on {column:'$(CheckBox1)'} rendered as two separate measures with two items checked, and live-collapsed to one when a value was deselected). Use a CheckBox here specifically when the goal is 'let the user pick which columns appear on this shelf' \u2014 for a single-valued swap, prefer one of the other five controls instead, since a CheckBox's own item ORDER isn't guaranteed to match the shelf's field order once more than one is selected. `ComponentName` must name an existing assembly of one of those six types \u2014 read_viewsheet_model lists assembly names and types; a typo, a deleted assembly, or a reference to a non-input assembly (a chart, a table, \u2026) is refused rather than saved and silently rendered wrong.";
+var DYNAMIC_AGGREGATE_DATE_LEVEL_REFERENCE_NOTE = "\n\n**A measure's `aggregate` and a dimension's `dateLevel` also accept `\"$(ComponentName)\"`** \u2014 the same dynamic-reference convention `column` takes, one level down: which formula (Sum/Average/...) or which grouping level (month/quarter/...) a Form component's live value picks, not which column. Example: a RadioButton with embedded values 'Sum'/'Average' bound via {column:'REVENUE', type:'measure', aggregate:'$(RadioButton1)'} swaps the formula when the RadioButton is pressed. Unlike `column`, a CheckBox reference is refused here \u2014 a formula/date-level is one value per field no matter how many fields a shelf holds, so there is no fan-out for 'which of the checked values' to resolve to. ComboBox, RadioButton, Slider, Spinner, and TextInput qualify; the same existence/type checks `column`'s reference gets apply here too.";
 var TABLE_PARAM = {
   type: "string",
   description: "The source table these fields come from. Optional. On a chart with no source yet this establishes it \u2014 the same thing dropping a column in the Composer does, which is why binding a field there never needs a separate step. Omit it and the table is inferred when the columns name exactly one; a name shared by several tables is refused rather than guessed, since the wrong guess renders a chart that looks right."
@@ -19411,6 +19576,9 @@ var AGGREGATE_FORMULA_ALIASES = new Map(
   ])
 );
 var AGGREGATE_FORMULA_NAME_LIST = AGGREGATE_FORMULAS.map((f) => f.formulaName).join(", ");
+var TWO_COLUMN_AGGREGATE_FORMULAS = /* @__PURE__ */ new Set(["Covariance", "Correlation", "WeightedAverage"]);
+var TWO_COLUMN_AGGREGATE_FORMULA_LIST = [...TWO_COLUMN_AGGREGATE_FORMULAS].join(", ");
+var SECONDARY_COLUMN_DESCRIPTION = "secondaryColumn \u2014 the second column an aggregate of " + TWO_COLUMN_AGGREGATE_FORMULA_LIST + " compares 'column' against (StyleBI's own Group and Aggregate / crosstab measure dialog asks for this the same way). Required when aggregate is one of those three formulas, refused when given for any other aggregate.";
 function normalizeAggregate(value, column) {
   const canonical = AGGREGATE_FORMULA_ALIASES.get(normalizeFormulaKey(value));
   if (canonical === void 0) {
@@ -19428,7 +19596,11 @@ var CALCULATE_INFO_FIELDS = {
     required: ["aggregate", "previous", "next"],
     optional: ["includeCurrentValue", "nullIfNoEnoughValue", "innerDim"]
   },
-  RUNNINGTOTAL: { required: ["aggregate", "resetLevel"], optional: ["breakBy"] },
+  // 'n'/'p' (bug #76795): ergonomic sugar, not a real StyleBI *CalcInfo field -- normalizeCalculateInfo
+  // folds whichever is given into 'aggregate' as StyleBI's own "FormulaName(N)" embedded-suffix
+  // convention (see the comment on RUNNINGTOTAL_NP_SUFFIX_PATTERN below) and removes it from the
+  // forwarded object, so it never actually reaches the wire.
+  RUNNINGTOTAL: { required: ["aggregate", "resetLevel"], optional: ["breakBy", "n", "p"] },
   COMPOUNDGROWTH: { required: ["aggregate", "resetLevel"], optional: ["breakBy"] }
 };
 var CALCULATE_INFO_CLASS_TYPE_LIST = Object.keys(CALCULATE_INFO_FIELDS).join(", ");
@@ -19439,6 +19611,8 @@ var CALCULATE_INFO_FIELD_KINDS = {
   next: "number",
   resetLevel: "number",
   aggregate: "string",
+  n: "number",
+  p: "number",
   columnName: "nullableString",
   breakBy: "nullableString",
   innerDim: "nullableString",
@@ -19451,7 +19625,25 @@ var CALCULATE_INFO_FIELD_KINDS = {
   includeCurrentValue: "nullableBoolean",
   nullIfNoEnoughValue: "nullableBoolean"
 };
-var CALCULATE_INFO_DESCRIPTION = "Measures only \u2014 a Trend/Calculator computed over the measure, mirroring StyleBI's Calculator hierarchy: {classType, ...fields}. classType is one of " + CALCULATE_INFO_CLASS_TYPE_LIST + `. PERCENT: {level (1=Grand Total, 2=Subtotal), columnName?}. PERCENT's byRow/byColumn are read-only, populated only in what get_table_binding echoes back \u2014 the direction of a percentage calculator is crosstab-wide, controlled by set_table_options's percentageBy, not per-measure; a byRow/byColumn sent here on write is accepted but silently ignored. CHANGE: {from (0=First, 1=Previous, 2=Next, 3=Last, 4=Previous Year, 5=Previous Quarter, 6=Previous Week, 7=Previous Month, 8=Previous Range), columnName?, asPercent?} \u2014 this is the per-measure '%Change'/'Change', distinct from set_date_comparison's whole-chart period comparison. VALUE: {from (same codes as CHANGE), columnName?}. MOVING: {aggregate, previous, next, includeCurrentValue?, nullIfNoEnoughValue?} \u2014 "moving average" is aggregate: "Average", there is no separate moving-average classType. RUNNINGTOTAL: {aggregate, resetLevel (-1=never reset, 0=Year, 1=Quarter, 2=Month, 3=Week, 4=Day, 5=Hour, 6=Minute), breakBy?}. COMPOUNDGROWTH: {aggregate, resetLevel (same codes as RUNNINGTOTAL), breakBy?}.`;
+var NP_AGGREGATE_FORMULAS = ["NthLargest", "NthSmallest", "NthMostFrequent", "PthPercentile"];
+var NP_AGGREGATE_FORMULA_LIST = NP_AGGREGATE_FORMULAS.join(", ");
+var RUNNINGTOTAL_NP_SUFFIX_PATTERN = /^(\w+)\((.+)\)$/;
+function validateRunningTotalAggregate(aggregate, column) {
+  const match = aggregate.match(RUNNINGTOTAL_NP_SUFFIX_PATTERN);
+  if (!match) return;
+  const [, base, suffix] = match;
+  if (!NP_AGGREGATE_FORMULAS.includes(base)) {
+    throw new Error(
+      `Field '${column}' has a 'calculateInfo.aggregate' of '${aggregate}' -- the '(...)' N/P suffix is only valid on ${NP_AGGREGATE_FORMULA_LIST}, not '${base}'.`
+    );
+  }
+  if (!/^-?\d+$/.test(suffix)) {
+    throw new Error(
+      `Field '${column}' has a 'calculateInfo.aggregate' of '${aggregate}', which has an invalid N/P operand -- expected an integer, got '${suffix}'.`
+    );
+  }
+}
+var CALCULATE_INFO_DESCRIPTION = "Measures only \u2014 a Trend/Calculator computed over the measure, mirroring StyleBI's Calculator hierarchy: {classType, ...fields}. classType is one of " + CALCULATE_INFO_CLASS_TYPE_LIST + `. PERCENT: {level (1=Grand Total, 2=Subtotal), columnName?}. PERCENT's byRow/byColumn are read-only, populated only in what get_table_binding echoes back \u2014 the direction of a percentage calculator is crosstab-wide, controlled by set_table_options's percentageBy, not per-measure; a byRow/byColumn sent here on write is accepted but silently ignored. CHANGE: {from (0=First, 1=Previous, 2=Next, 3=Last, 4=Previous Year, 5=Previous Quarter, 6=Previous Week, 7=Previous Month, 8=Previous Range), columnName?, asPercent?} \u2014 this is the per-measure '%Change'/'Change', distinct from set_date_comparison's whole-chart period comparison. VALUE: {from (same codes as CHANGE), columnName?}. MOVING: {aggregate, previous, next, includeCurrentValue?, nullIfNoEnoughValue?} \u2014 "moving average" is aggregate: "Average", there is no separate moving-average classType. RUNNINGTOTAL: {aggregate, resetLevel (-1=never reset, 0=Year, 1=Quarter, 2=Month, 3=Week, 4=Day, 5=Hour, 6=Minute), breakBy?, n?, p?} \u2014 ` + NP_AGGREGATE_FORMULA_LIST + ` each take an N/P operand, which StyleBI encodes as a parenthesized suffix embedded in aggregate itself (e.g. aggregate: "NthLargest(3)"), the same convention its own Composer UI uses; pass 'n' (or 'p', an alias \u2014 pass one, not both) instead of learning that convention, and it is folded into aggregate for you. A non-integer operand, or an operand on any other formula, is refused rather than silently computing a plain running total. COMPOUNDGROWTH: {aggregate, resetLevel (same codes as RUNNINGTOTAL), breakBy?} \u2014 has no N/P operand support: StyleBI's CompoundGrowthCalcInfo never reads aggregate at all.`;
 function normalizeCalculateInfo(value, column) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(
@@ -19495,6 +19687,41 @@ function normalizeCalculateInfo(value, column) {
       );
     }
     out[key] = fieldValue;
+  }
+  if (classType === "RUNNINGTOTAL") {
+    const hasN = !absent(raw.n);
+    const hasP = !absent(raw.p);
+    if (hasN && hasP) {
+      throw new Error(
+        `Field '${column}' has a 'calculateInfo' with both 'n' and 'p' -- 'p' is only an alias for 'n' (PthPercentile's operand is still just a number embedded in aggregate the same way). Pass one.`
+      );
+    }
+    if (hasN || hasP) {
+      const key = hasN ? "n" : "p";
+      const npValue = out[key];
+      delete out.n;
+      delete out.p;
+      if (typeof npValue !== "number" || !Number.isInteger(npValue)) {
+        throw new Error(
+          `Field '${column}' has a 'calculateInfo.${key}' of ${JSON.stringify(npValue)}, which must be an integer.`
+        );
+      }
+      const baseAggregate = typeof out.aggregate === "string" ? out.aggregate : "";
+      if (RUNNINGTOTAL_NP_SUFFIX_PATTERN.test(baseAggregate)) {
+        throw new Error(
+          `Field '${column}' has both a '${key}' and an 'aggregate' of '${baseAggregate}' that already embeds an operand -- ambiguous. Pass the operand only once, either via '${key}' or embedded directly in 'aggregate', not both.`
+        );
+      }
+      if (!NP_AGGREGATE_FORMULAS.includes(baseAggregate)) {
+        throw new Error(
+          `Field '${column}' has a 'calculateInfo.${key}' but its 'aggregate' is '${baseAggregate}', which does not take an N/P operand. '${key}' is only valid with aggregate ${NP_AGGREGATE_FORMULA_LIST}.`
+        );
+      }
+      out.aggregate = `${baseAggregate}(${npValue})`;
+    }
+    if (typeof out.aggregate === "string") {
+      validateRunningTotalAggregate(out.aggregate, column);
+    }
   }
   return out;
 }
@@ -19586,11 +19813,49 @@ function validateFields(fields, opts) {
         `Field '${column}' carries ${typeKeys.map((key) => `'${key}'`).join(" and ")}. This write cannot set one \u2014 that is set_chart_type with 'field', on a multi-style chart. Remove both 'chartType' and 'runtimeChartType' from a field read out of get_binding before writing it back, then set the type; passing either would have been dropped silently.`
       );
     }
+    const visibilityKeys = ["visible", "hidden"].filter((key) => field[key] !== void 0);
+    if (visibilityKeys.length > 0) {
+      throw new Error(
+        `Field '${column}' carries ${visibilityKeys.map((key) => `'${key}'`).join(" and ")}. This write cannot set column display visibility \u2014 use set_table_field_visibility on a Table (Crosstab hide/show is not yet supported). Remove ${visibilityKeys.length > 1 ? "these keys" : `'${visibilityKeys[0]}'`}; passing ${visibilityKeys.length > 1 ? "them" : "it"} would have been dropped silently.`
+      );
+    }
     const out = { column, type };
     if (!absent(field.aggregate)) {
-      out.aggregate = normalizeAggregate(String(field.aggregate).trim(), column);
+      const aggregateRef = opts?.dynamicAggregateRefs ? extractComponentReference(field.aggregate, `Field '${column}'s 'aggregate'`) : null;
+      if (aggregateRef !== null) {
+        opts.dynamicAggregateRefs.add(aggregateRef);
+        out.aggregate = String(field.aggregate).trim();
+      } else {
+        out.aggregate = normalizeAggregate(String(field.aggregate).trim(), column);
+      }
     }
-    if (field.dateLevel !== void 0) out.dateLevel = normalizeDateLevel(field.dateLevel, column);
+    if (!absent(field.secondaryColumn)) {
+      if (typeof field.secondaryColumn !== "string") {
+        throw new Error(
+          `Field '${column}' has a 'secondaryColumn' of ${JSON.stringify(field.secondaryColumn)} -- it takes a column name string.`
+        );
+      }
+      const isTwoColumnFormula = out.aggregate !== void 0 && TWO_COLUMN_AGGREGATE_FORMULAS.has(out.aggregate);
+      if (!isTwoColumnFormula) {
+        throw new Error(
+          `Field '${column}' carries a 'secondaryColumn' but its aggregate is ${out.aggregate ? `'${out.aggregate}'` : "not set"}, which does not use a second column. 'secondaryColumn' is only valid with aggregate ${TWO_COLUMN_AGGREGATE_FORMULA_LIST} -- remove it, or set aggregate to one of those.`
+        );
+      }
+      out.secondaryColumn = field.secondaryColumn.trim();
+    } else if (out.aggregate !== void 0 && TWO_COLUMN_AGGREGATE_FORMULAS.has(out.aggregate)) {
+      throw new Error(
+        `Field '${column}' has an aggregate of '${out.aggregate}', which requires a second column -- pass 'secondaryColumn' naming it. Omitting it lets StyleBI accept the write and then fail later, when it tries to compute the value, leaving the invalid aggregate committed with no second column.`
+      );
+    }
+    if (field.dateLevel !== void 0) {
+      const dateLevelRef = opts?.dynamicDateLevelRefs ? extractComponentReference(field.dateLevel, `Field '${column}'s 'dateLevel'`) : null;
+      if (dateLevelRef !== null) {
+        opts.dynamicDateLevelRefs.add(dateLevelRef);
+        out.dateLevel = String(field.dateLevel).trim();
+      } else {
+        out.dateLevel = normalizeDateLevel(field.dateLevel, column);
+      }
+    }
     if (!absent(field.namedGroup)) out.namedGroup = field.namedGroup;
     if (!absent(field.calculateInfo)) {
       out.calculateInfo = normalizeCalculateInfo(field.calculateInfo, column);
@@ -19602,12 +19867,33 @@ function validateFields(fields, opts) {
     return out;
   });
 }
-async function resolveDynamicColumnRefs(deps, token, dynamicColumnRefs, tool) {
-  if (dynamicColumnRefs.size === 0) return;
+async function resolveDynamicColumnRefs(deps, token, refs, tool) {
+  const aggregates = refs.aggregates ?? /* @__PURE__ */ new Set();
+  const dateLevels = refs.dateLevels ?? /* @__PURE__ */ new Set();
+  if (refs.columns.size === 0 && aggregates.size === 0 && dateLevels.size === 0) return;
   const model = await deps.wizClient.get(path3(token, "model"));
   const assemblies = model?.assemblies ?? [];
-  for (const name of dynamicColumnRefs) {
-    requireResolvableComponentReference(name, `${tool}'s field bound to "$(${name})"`, assemblies);
+  for (const name of refs.columns) {
+    requireResolvableComponentReference(
+      name,
+      `${tool}'s field bound to "$(${name})"`,
+      assemblies,
+      { allowMultiValued: true }
+    );
+  }
+  for (const name of aggregates) {
+    requireResolvableComponentReference(
+      name,
+      `${tool}'s field aggregate bound to "$(${name})"`,
+      assemblies
+    );
+  }
+  for (const name of dateLevels) {
+    requireResolvableComponentReference(
+      name,
+      `${tool}'s field dateLevel bound to "$(${name})"`,
+      assemblies
+    );
   }
 }
 function normalizeTable(table, tool) {
@@ -19696,7 +19982,7 @@ async function restoreShelfChartTypes(deps, token, assembly, captured, fields) {
 function makeSetChartShelfTool(deps) {
   return {
     name: "set_chart_shelf",
-    description: "Replace the fields on one of a chart's data shelves: " + CHART_SHELVES.join(", ") + ".\n\nEach field is {column, type, aggregate?, dateLevel?, calculateInfo?}. 'type' is mandatory and is 'dimension' or 'measure' \u2014 it is never inferred ('role' is accepted as an alias). An aggregate belongs only to a measure, a dateLevel only to a dimension. calculateInfo \u2014 a per-measure Trend/Calculator \u2014 also belongs only to a measure. " + CALCULATE_INFO_DESCRIPTION + " A 'chartType' is refused rather than ignored, and so is the 'runtimeChartType' reported beside it: get_binding reports both per measure on a multi-style chart, but setting a type is set_chart_type's job, so passing a field object straight back from that read fails here instead of dropping it in silence.\n\n'fields' is always required: pass an explicit empty array to clear a shelf. Omitting it is an error rather than a silent clear." + ONE_SOURCE_NOTE + DYNAMIC_COLUMN_REFERENCE_NOTE + "\n\n**Which shelves a chart reads depends on its type**, the same way set_chart_single_shelf's shelves do. A treemap/sunburst/circle_packing/icicle reads only 'size' (set with set_aesthetic_field) \u2014 a measure placed on x or y for one of those is refused here rather than accepted and rendered as a flat, uniformly-sized layout with no error.\n\nA tree/network/circular chart additionally requires 'source' and 'target' \u2014 set with set_chart_single_shelf, not this tool \u2014 to identify each node/edge. Binding 'group' alone (this tool's node-label shelf for that family) with neither 'source' nor 'target' set is refused here rather than accepted and left to render nothing: get_viewsheet_image would hang retrying a graph that can never finish.\n\n'x' and 'y' each accept more than one dimension. Binding 2+ dimensions to the SAME shelf builds a real small-multiples/trellis: one panel per distinct value of the FIRST (outermost) dimension, with the remaining dimension(s) drawn as the inner axis inside each panel. Example \u2014 'monthly order trend per region, side by side': set_chart_shelf(shelf:'x', fields:[{column:'REGION', type:'dimension'}, {column:'MONTH', type:'dimension'}]) with a count measure still on 'y' produces one panel per REGION, each showing its own MONTH axis. This needs no other tool \u2014 it is not nested axis categories, and it is not the same thing as set_chart_type's 'Separate Graphs' option (which splits by measure, not by dimension).\n\nA measure on 'y' may also carry 'secondaryY' (boolean, or its alias 'secondary') to place it on the chart's secondary Y axis. Refused rather than silently ignored on a dimension, on 'group', or on 'x' \u2014 the secondary axis is measures only, 'y' shelf only (the render never reads a secondary-axis flag off an x-shelf measure) \u2014 and on a chart type or a separated (small-multiples) graph that cannot render one, the same way a tree-family chart refuses a measure on x/y above. Because this call replaces the WHOLE shelf, resend every field already on it, including 'secondaryY: true' on any that already carry it \u2014 a resend that omits it silently moves that field back to the primary axis.\n\nOne call is one undo checkpoint. This changes what the chart shows, so look at the result with get_viewsheet_image before reporting success.",
+    description: "Replace the fields on one of a chart's data shelves: " + CHART_SHELVES.join(", ") + ".\n\nEach field is {column, type, aggregate?, dateLevel?, calculateInfo?}. 'type' is mandatory and is 'dimension' or 'measure' \u2014 it is never inferred ('role' is accepted as an alias). An aggregate belongs only to a measure, a dateLevel only to a dimension. calculateInfo \u2014 a per-measure Trend/Calculator \u2014 also belongs only to a measure. " + CALCULATE_INFO_DESCRIPTION + " A 'chartType' is refused rather than ignored, and so is the 'runtimeChartType' reported beside it: get_binding reports both per measure on a multi-style chart, but setting a type is set_chart_type's job, so passing a field object straight back from that read fails here instead of dropping it in silence.\n\n'fields' is always required: pass an explicit empty array to clear a shelf. Omitting it is an error rather than a silent clear." + ONE_SOURCE_NOTE + DYNAMIC_COLUMN_REFERENCE_NOTE + DYNAMIC_AGGREGATE_DATE_LEVEL_REFERENCE_NOTE + "\n\n**Which shelves a chart reads depends on its type**, the same way set_chart_single_shelf's shelves do. A treemap/sunburst/circle_packing/icicle reads only 'size' (set with set_aesthetic_field) \u2014 a measure placed on x or y for one of those is refused here rather than accepted and rendered as a flat, uniformly-sized layout with no error.\n\nA tree/network/circular chart additionally requires 'source' and 'target' \u2014 set with set_chart_single_shelf, not this tool \u2014 to identify each node/edge. Binding 'group' alone (this tool's node-label shelf for that family) with neither 'source' nor 'target' set is refused here rather than accepted and left to render nothing: get_viewsheet_image would hang retrying a graph that can never finish.\n\n'x' and 'y' each accept more than one dimension. Binding 2+ dimensions to the SAME shelf builds a real small-multiples/trellis: one panel per distinct value of the FIRST (outermost) dimension, with the remaining dimension(s) drawn as the inner axis inside each panel. Example \u2014 'monthly order trend per region, side by side': set_chart_shelf(shelf:'x', fields:[{column:'REGION', type:'dimension'}, {column:'MONTH', type:'dimension'}]) with a count measure still on 'y' produces one panel per REGION, each showing its own MONTH axis. This needs no other tool \u2014 it is not nested axis categories, and it is not the same thing as set_chart_type's 'Separate Graphs' option (which splits by measure, not by dimension).\n\nA measure on 'y' may also carry 'secondaryY' (boolean, or its alias 'secondary') to place it on the chart's secondary Y axis. Refused rather than silently ignored on a dimension, on 'group', or on 'x' \u2014 the secondary axis is measures only, 'y' shelf only (the render never reads a secondary-axis flag off an x-shelf measure) \u2014 and on a chart type or a separated (small-multiples) graph that cannot render one, the same way a tree-family chart refuses a measure on x/y above. Because this call replaces the WHOLE shelf, resend every field already on it, including 'secondaryY: true' on any that already carry it \u2014 a resend that omits it silently moves that field back to the primary axis.\n\nOne call is one undo checkpoint. This changes what the chart shows, so look at the result with get_viewsheet_image before reporting success.",
     inputSchema: {
       type: "object",
       properties: {
@@ -19742,10 +20028,22 @@ function makeSetChartShelfTool(deps) {
         );
       }
       const dynamicColumnRefs = /* @__PURE__ */ new Set();
-      const fields = validateFields(args.fields, { allowSecondaryY: true, dynamicColumnRefs });
+      const dynamicAggregateRefs = /* @__PURE__ */ new Set();
+      const dynamicDateLevelRefs = /* @__PURE__ */ new Set();
+      const fields = validateFields(args.fields, {
+        allowSecondaryY: true,
+        dynamicColumnRefs,
+        dynamicAggregateRefs,
+        dynamicDateLevelRefs
+      });
       const table = normalizeTable(args.table, "set_chart_shelf");
       const token = await requireSession2(deps);
-      await resolveDynamicColumnRefs(deps, token, dynamicColumnRefs, "set_chart_shelf");
+      await resolveDynamicColumnRefs(
+        deps,
+        token,
+        { columns: dynamicColumnRefs, aggregates: dynamicAggregateRefs, dateLevels: dynamicDateLevelRefs },
+        "set_chart_shelf"
+      );
       if (shelf !== "y") {
         const offender = fields.find((f) => f.secondaryY !== void 0);
         if (offender) {
@@ -19969,7 +20267,7 @@ var CHART_SINGLE_SHELVES = [
 function makeSetChartSingleShelfTool(deps) {
   return {
     name: "set_chart_single_shelf",
-    description: "Bind one of the chart shelves that hold exactly one field:\n\n  open, high, low, close   candlestick / OHLC\n  start, end, milestone    Gantt\n  source, target           network / flow (including tree)\n  path                     path ordering\n\nThese are separate from set_chart_shelf because they hold a single field rather than a list \u2014 passing a list would bind the first and drop the rest.\n\n**Which shelves a chart reads depends on its type.** A candlestick uses open/high/low/close and ignores x and y; a Gantt uses start/end/milestone. Binding the wrong family for the current type renders an empty chart with no error, so set the chart type first and check the result with get_viewsheet_image." + ONE_SOURCE_NOTE + DYNAMIC_COLUMN_REFERENCE_NOTE + "\n\nA tree/network/circular chart needs BOTH 'source' and 'target' bound before it can render at all \u2014 set_chart_shelf's 'group' shelf alone is not enough for this family. Clearing 'source' or 'target' (field: null) on one of these charts while the other is still bound leaves it unrenderable again the same way.\n\nPass field: null to clear a shelf. One call is one undo checkpoint.",
+    description: "Bind one of the chart shelves that hold exactly one field:\n\n  open, high, low, close   candlestick / OHLC\n  start, end, milestone    Gantt\n  source, target           network / flow (including tree)\n  path                     path ordering\n\nThese are separate from set_chart_shelf because they hold a single field rather than a list \u2014 passing a list would bind the first and drop the rest.\n\n**Which shelves a chart reads depends on its type.** A candlestick uses open/high/low/close and ignores x and y; a Gantt uses start/end/milestone. Binding the wrong family for the current type renders an empty chart with no error, so set the chart type first and check the result with get_viewsheet_image." + ONE_SOURCE_NOTE + DYNAMIC_COLUMN_REFERENCE_NOTE + DYNAMIC_AGGREGATE_DATE_LEVEL_REFERENCE_NOTE + "\n\nA tree/network/circular chart needs BOTH 'source' and 'target' bound before it can render at all \u2014 set_chart_shelf's 'group' shelf alone is not enough for this family. Clearing 'source' or 'target' (field: null) on one of these charts while the other is still bound leaves it unrenderable again the same way.\n\nPass field: null to clear a shelf. One call is one undo checkpoint.",
     inputSchema: {
       type: "object",
       properties: {
@@ -20006,10 +20304,20 @@ function makeSetChartSingleShelfTool(deps) {
         );
       }
       const dynamicColumnRefs = /* @__PURE__ */ new Set();
-      const field = args.field == null ? null : validateFields(args.field, { dynamicColumnRefs })[0] ?? null;
+      const dynamicAggregateRefs = /* @__PURE__ */ new Set();
+      const dynamicDateLevelRefs = /* @__PURE__ */ new Set();
+      const field = args.field == null ? null : validateFields(
+        args.field,
+        { dynamicColumnRefs, dynamicAggregateRefs, dynamicDateLevelRefs }
+      )[0] ?? null;
       const table = normalizeTable(args.table, "set_chart_single_shelf");
       const token = await requireSession2(deps);
-      await resolveDynamicColumnRefs(deps, token, dynamicColumnRefs, "set_chart_single_shelf");
+      await resolveDynamicColumnRefs(
+        deps,
+        token,
+        { columns: dynamicColumnRefs, aggregates: dynamicAggregateRefs, dateLevels: dynamicDateLevelRefs },
+        "set_chart_single_shelf"
+      );
       if (field) {
         await refuseDateTypedDimensionWithoutLevel(deps, token, assembly, table, [field]);
       }
@@ -20666,6 +20974,9 @@ function makeBindingTools(deps) {
   ];
 }
 
+// src/tools/worksheetTools.ts
+import nodePath2 from "path";
+
 // ../shared/core/src/tabular/endpointCatalogNormalization.ts
 function normalizeEndpointLookup(raw) {
   const targets = raw.endpoints?.length ? raw.endpoints : raw.endpoint ? [raw.endpoint] : [];
@@ -21011,6 +21322,11 @@ async function assertEditJoinResolvable(deps, token, args) {
     );
   }
   const edge = joins[0];
+  if (edge.op === "MERGE_JOIN") {
+    throw new Error(
+      `edit_join: "${args.name}" is a MERGE join -- rows are paired by position, not by key, so it has no join keys to edit here (same as the native Composer UI). Remove it and rebuild with add_join (joinType "MERGE") instead.`
+    );
+  }
   const hasKeyArg = args.leftKey !== void 0 || args.rightKey !== void 0 || (args.leftKeys?.length ?? 0) > 0 || (args.rightKeys?.length ?? 0) > 0;
   if (!hasKeyArg || joinType === "CROSS" || joinType === "MERGE") return;
   const useMultiKeys = (args.leftKeys?.length ?? 0) > 0 && (args.rightKeys?.length ?? 0) > 0;
@@ -21019,6 +21335,38 @@ async function assertEditJoinResolvable(deps, token, args) {
   const displayJoinType = joinType ?? edge.op ?? "existing";
   assertJoinKeyResolvesOnTable("edit_join", model, edge.leftTable, leftKeys, displayJoinType);
   assertJoinKeyResolvesOnTable("edit_join", model, edge.rightTable, rightKeys, displayJoinType);
+}
+async function assertAddTableToJoinResolvable(deps, token, args) {
+  const joinType = normalizeJoinType(args.joinType, "add_table_to_join");
+  if (joinType === "CROSS" || joinType === "MERGE") {
+    throw new Error(
+      `add_table_to_join: joinType "${joinType}" is not supported here -- CROSS cannot be combined with the join's other existing edges, and MERGE is a distinct assembly type (use add_table_to_merge_join instead).`
+    );
+  }
+  const model = await readModel(deps, token);
+  const target = model.tables?.find((t) => t.name === args.name);
+  if (!target || target.type !== "JOIN") {
+    throw new Error(
+      `add_table_to_join: "${args.name}" is not a join assembly, so it cannot be extended here.`
+    );
+  }
+  const joins = target.joins ?? [];
+  if (joins.length > 0 && joins[0].op === "MERGE_JOIN") {
+    throw new Error(
+      `add_table_to_join: "${args.name}" is a MERGE join -- rows are paired by position, not by key, so it has no join keys to extend by. Use add_table_to_merge_join instead.`
+    );
+  }
+  const sources = target.sources ?? [];
+  if (!sources.includes(args.existingTable)) {
+    throw new Error(
+      `add_table_to_join: "${args.existingTable}" is not one of "${args.name}"'s own source tables (${sources.join(", ") || "none"}) -- existingTable must already belong to the join being extended; read_worksheet_model's "sources" field on "${args.name}" lists them.`
+    );
+  }
+  const useMultiKeys = (args.existingKeys?.length ?? 0) > 0 && (args.newKeys?.length ?? 0) > 0;
+  const existingKeys = useMultiKeys ? args.existingKeys : [args.existingKey];
+  const newKeys = useMultiKeys ? args.newKeys : [args.newKey];
+  assertJoinKeyResolvesOnTable("add_table_to_join", model, args.existingTable, existingKeys, joinType);
+  assertJoinKeyResolvesOnTable("add_table_to_join", model, args.newTable, newKeys, joinType);
 }
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -21071,6 +21419,13 @@ function assertColumnAddableToAggregate(model, table, columnName, toolName) {
   if (alreadyExists) return;
   throw new Error(
     `${toolName}: table "${table}" has a group/aggregate applied (set_group_aggregate), and a grouped table's query only outputs columns that are a group key or an aggregate formula \u2014 a new column named "${columnName}" is neither, so it won't appear in the output even though the edit itself succeeds and the column shows up in read_worksheet_model. No error either way. Two ways to fix it: mirror this table first (add_mirror(name: "<new-name>", source: "${table}")) and call ${toolName} on the mirror instead, or, if "${columnName}" should behave as another group key rather than a separate view, add it to the groups list via a follow-up set_group_aggregate call instead.`
+  );
+}
+function assertRankingOfRequiresGroup(model, table, of, toolName) {
+  const target = model.tables?.find((t) => t.name === table);
+  if (!target || target.aggregates) return;
+  throw new Error(
+    `${toolName}: table "${table}" is not grouped, so 'of' (${JSON.stringify(of)}) has no group to rank against \u2014 'of' means "rank field's groups by this aggregate," which only makes sense once the table has been grouped (StyleBI's own Composer ranking-condition editor doesn't even show the 'of' picker until then). Call set_group_aggregate on this table first, or omit 'of' to rank raw rows by 'field' directly.`
   );
 }
 var TABLE_BRACKET_REF = /([A-Za-z_$][\w$]*)\s*\[\s*(['"])((?:(?!\2)[\s\S])*)\2\s*\]/g;
@@ -21805,6 +22160,46 @@ function classifyDisclosure(req) {
         "narrows",
         `${req.table} no longer draws from '${req.name}' \u2014 for a UNION this can remove rows; for an INTERSECT or MINUS assembly, removing a source can instead ADD what's shown (fewer things excluded). If fewer than two source tables remain, the whole assembly is deleted. Either way, nothing on screen marks that a source changed.`
       );
+    /**
+     * Property edit on an EXISTING concatenation, addressed by table name — the sibling of
+     * add_concat_subtable/remove_concat_subtable (which change membership) rather than of
+     * add_concatenation (which builds a new assembly). Every branch names the "applied to every
+     * connection" behavior explicitly: a concatenation can legally hold a different operation per
+     * adjacent pair (`A UNION B MINUS C`), and this op has no way to retarget just one connection —
+     * it flattens whatever was there before to a single value across the whole assembly, silently,
+     * with no read-side warning beforehand. A caller who did not realize the concatenation had a
+     * mixed per-pair state needs to see that in the result, not just in the tool description.
+     */
+    case "edit_concatenation": {
+      const result = req.table ?? "";
+      const concatType = req.concatType?.toUpperCase();
+      if (!concatType) {
+        return disclosure(
+          result,
+          "meaning",
+          `${result}'s duplicate-row handling changed, applied to every connection in this concatenation \u2014 the same source rows can now appear once instead of every time they occur, or vice versa, changing the row count with nothing on screen marking the change.`
+        );
+      }
+      if (concatType === "INTERSECT") {
+        return disclosure(
+          result,
+          "narrows",
+          `${result} is now an INTERSECT, applied to every connection in this concatenation \u2014 only rows common to every source survive, which can be far fewer than before.`
+        );
+      }
+      if (concatType === "MINUS") {
+        return disclosure(
+          result,
+          "narrows",
+          `${result} is now a MINUS, applied to every connection in this concatenation \u2014 rows also present in the later sources are removed.`
+        );
+      }
+      return disclosure(
+        result,
+        "widens",
+        `${result} is now a UNION, applied to every connection in this concatenation \u2014 it can show more rows than before, rendering like one ordinary table.`
+      );
+    }
     case "reorder_concat_subtables":
       return disclosure(
         req.table ?? "",
@@ -21846,12 +22241,11 @@ function classifyDisclosure(req) {
         "meaning",
         `'${req.column}' on ${assembly} now buckets values with different boundaries \u2014 every value it produces can change while its name and column position stay the same.`
       );
-    case "convert_to_embedded":
-      return disclosure(
-        req.table ?? "",
-        "meaning",
-        `${req.table} is now a frozen, point-in-time snapshot instead of a live query \u2014 it will not reflect future changes to the underlying source, with nothing on screen marking that it has stopped updating.`
-      );
+    // convert_to_embedded (WBS-054, #76753): now a custom (non-makeEditTool) tool implementation
+    // that builds its own disclosure directly from the POST response's resolved new-table name --
+    // classifyDisclosure only ever sees the pre-call `req`, which can no longer name the actual
+    // snapshot table now that `table` itself is left untouched. Handling this case here too would
+    // just produce a second, conflicting (and wrong -- naming the untouched original) disclosure.
     // Ruled OUT, not merely unchecked (spec: "genuinely unclear... worth a specific ruling, not
     // a default"). Hiding a column is a deliberate, rendered-in-the-output action — the viewer
     // sees exactly the columns that are shown, with no discrepancy between the rendered table and
@@ -21874,12 +22268,12 @@ function assertCustomLookupUrlPlaceholders(customLookups) {
     }
   });
 }
-function resolveSuffixPlaceholders(suffix, parameters) {
+function resolveSuffixPlaceholders(toolName, suffix, parameters) {
   return suffix.replace(/\{(\w+)\}/g, (match, name) => {
     const value = parameters?.[name];
     if (value === void 0) {
       throw new Error(
-        `add_table's suffix "${suffix}" references placeholder {${name}}, but parameters has no entry for "${name}" -- every {name} placeholder in suffix must have a matching key in parameters. Got parameters: ${JSON.stringify(parameters)}`
+        `${toolName}'s suffix "${suffix}" references placeholder {${name}}, but parameters has no entry for "${name}" -- every {name} placeholder in suffix must have a matching key in parameters. Got parameters: ${JSON.stringify(parameters)}`
       );
     }
     return encodeURIComponent(value);
@@ -22525,7 +22919,7 @@ function makeWorksheetTools(deps) {
     ),
     makeEditTool(
       "set_group_aggregate",
-      "Set grouping and aggregate definitions on a worksheet table. Available formulas: Sum, Count, Average, Max, Min, Count Distinct, Count All, First, Last, Variance, Standard Deviation, Median, Mode, Product, Concat, NthLargest, NthSmallest, NthMostFrequent, PthPercentile, Correlation, Covariance, Population Variance, Population Standard Deviation, Weighted Average. An unrecognized formula name is refused rather than silently substituted with Sum. NthLargest/NthSmallest/NthMostFrequent/PthPercentile require the aggregate's 'n' parameter (the N, or the P for PthPercentile) \u2014 do not embed it in the formula string (e.g. do not send formula 'NthLargest(5)'); set n:5 instead. Use with set_ranking for top/bottom N queries (e.g. 'top 5 customers by order count': group by customer with Count, then set_ranking TOP_N 5). To group a date column by a coarser granularity (e.g. 'by quarter', 'by month'), set dateLevel directly on that group entry \u2014 do NOT use add_date_range_column for this; dateLevel groups the existing date column in place, matching the Composer UI's Group and Aggregate dialog, instead of creating a separate derived column. To group by a predefined named group (created via add_named_group), set namedGroup to that group's name on the group entry instead of grouping by exact value; mutually exclusive with dateLevel on the same entry. Set crosstab: true to display the result as a crosstab (row/column headers) instead of a flat grouped table \u2014 the same 'Switch to Crosstab' toggle in the Composer's Group and Aggregate dialog; worksheets DO support crosstab mode natively. In crosstab mode, 'groups[0]' becomes the column header and every subsequent entry becomes a row header, by array position \u2014 there is no separate row/column flag. crosstab: true requires at least 2 groups and at least 1 aggregate \u2014 passing fewer is refused with an error naming the actual counts, rather than silently applying a non-crosstab result. Prefer this over add_sql_query for grouping and aggregation.\n\n**Known limitation:** a chart/crosstab binding session that was connected to this table before (or independently of) this call will keep showing the table's raw pre-aggregation columns via list_bindable_fields afterward, instead of the new group/aggregate shape, until save_worksheet is called. This is a permanent architectural characteristic, not an open bug: the worksheet-editing session and the viewsheet/binding session run as separate StyleBI runtimes that never share state, and save_worksheet is required, not merely helpful, to make the change visible to that other session.",
+      "Set grouping and aggregate definitions on a worksheet table. Available formulas: Sum, Count, Average, Max, Min, Count Distinct, Count All, First, Last, Variance, Standard Deviation, Median, Mode, Product, Concat, NthLargest, NthSmallest, NthMostFrequent, PthPercentile, Correlation, Covariance, Population Variance, Population Standard Deviation, Weighted Average. An unrecognized formula name is refused rather than silently substituted with Sum. First, Last, Correlation, Covariance, and Weighted Average are currently refused outright due to a known StyleBI backend engine limitation: the secondary/'By' column these formulas require does not survive to the query-execution engine even when correctly supplied, so calling this tool with any of them fails with a formula-named error rather than producing a result. NthLargest/NthSmallest/NthMostFrequent/PthPercentile require the aggregate's 'n' parameter (the N, or the P for PthPercentile) \u2014 do not embed it in the formula string (e.g. do not send formula 'NthLargest(5)'); set n:5 instead. Use with set_ranking for top/bottom N queries (e.g. 'top 5 customers by order count': group by customer with Count, then set_ranking TOP_N 5). To group a date column by a coarser granularity (e.g. 'by quarter', 'by month'), set dateLevel directly on that group entry \u2014 do NOT use add_date_range_column for this; dateLevel groups the existing date column in place, matching the Composer UI's Group and Aggregate dialog, instead of creating a separate derived column. To group by a predefined named group (created via add_named_group), set namedGroup to that group's name on the group entry instead of grouping by exact value; mutually exclusive with dateLevel on the same entry. Set crosstab: true to display the result as a crosstab (row/column headers) instead of a flat grouped table \u2014 the same 'Switch to Crosstab' toggle in the Composer's Group and Aggregate dialog; worksheets DO support crosstab mode natively. In crosstab mode, 'groups[0]' becomes the column header and every subsequent entry becomes a row header, by array position \u2014 there is no separate row/column flag. crosstab: true requires at least 2 groups and at least 1 aggregate \u2014 passing fewer is refused with an error naming the actual counts, rather than silently applying a non-crosstab result. Prefer this over add_sql_query for grouping and aggregation.\n\n**Known limitation:** a chart/crosstab binding session that was connected to this table before (or independently of) this call will keep showing the table's raw pre-aggregation columns via list_bindable_fields afterward, instead of the new group/aggregate shape, until save_worksheet is called. This is a permanent architectural characteristic, not an open bug: the worksheet-editing session and the viewsheet/binding session run as separate StyleBI runtimes that never share state, and save_worksheet is required, not merely helpful, to make the change visible to that other session.",
       {
         table: { type: "string" },
         groups: {
@@ -22680,7 +23074,7 @@ function makeWorksheetTools(deps) {
     ),
     makeEditTool(
       "add_join",
-      "Add a join between two tables, OR three or more tables into a single combined assembly in one call (matching what Composer's own multi-select-then-join does in the UI). For two tables: give leftTable/rightTable (+ leftKey/rightKey, or leftKeys/rightKeys for a multi-key join). For three or more tables joined together AT THE SAME TIME: give joinPaths instead \u2014 an array of edges, each {leftTable, leftKey, rightTable, rightKey, joinType}. Edges do not need to form a left-to-right chain: either side of any edge may name a table introduced by another edge (e.g. one hub table joined to two others), so a star-shaped join works in a single call, not just a linear one. leftTable/leftKey/rightTable/rightKey/joinType/leftKeys/rightKeys are ignored when joinPaths is given. Chaining separate add_join calls onto an existing join assembly (2 tables, then a 3rd, etc.) still works too, but produces nested assemblies rather than one combined view \u2014 prefer joinPaths when the goal is genuinely one multi-table view built in a single call. joinType (per pair, or per joinPaths edge): INNER (default), LEFT, RIGHT, FULL, CROSS, MERGE. CROSS joins ignore key columns. MERGE joins match rows by position and is only valid for the two-table form (use add_merge_join for 3+ tables matched by position); joinPaths rejects MERGE per edge. CROSS is also restricted in joinPaths: it may only be used when it is the SOLE edge in the call (a cross join is an exclusive operation and cannot be combined with any other edge) \u2014 for 3+ tables where one pair should be cross-joined, do that pair as its own add_cross_join / single-edge add_join call and join the result into the rest separately. The key column(s) are verified against both tables before posting (except for CROSS/MERGE, which use none), so a key naming a column neither table has is refused here instead of silently producing a zero-column join that StyleBI later removes. Logical model entities do NOT expose foreign-key columns as attributes \u2014 use get_datasource_relationships to find the physical join path before joining two entities from the same model. IMPORTANT \u2014 cross-join safety: when chaining a 3rd+ table onto an existing join assembly (rather than using joinPaths), the join key column you reference must still be visible (not hidden) in the left table. If you get a 'cross join' error, check that the key column (e.g. CATEGORY_ID) is visible in the left assembly before adding the next join. Use set_column_visibility to restore it if needed.",
+      "Add a join between two tables, OR three or more tables into a single combined assembly in one call (matching what Composer's own multi-select-then-join does in the UI). For two tables: give leftTable/rightTable (+ leftKey/rightKey, or leftKeys/rightKeys for a multi-key join). For three or more tables joined together AT THE SAME TIME: give joinPaths instead \u2014 an array of edges, each {leftTable, leftKey, rightTable, rightKey, joinType}. Edges do not need to form a left-to-right chain: either side of any edge may name a table introduced by another edge (e.g. one hub table joined to two others), so a star-shaped join works in a single call, not just a linear one. leftTable/leftKey/rightTable/rightKey/joinType/leftKeys/rightKeys are ignored when joinPaths is given. Chaining a plain table onto an existing join assembly (via a second add_join call) extends that join in place \u2014 the plain table becomes a new member of the SAME assembly, under the SAME name \u2014 instead of nesting it inside a new outer join. This is symmetric: it does not matter whether the existing join is given as leftTable or rightTable. Nesting (building a brand-new assembly with the two sides as its two sources) still happens in the other two cases: both leftTable and rightTable already name existing join assemblies, or neither does. add_table_to_join/add_table_to_merge_join are still available as an alternative, more explicit way to extend an existing join in place (naming one of the join's own CURRENT member tables as existingTable, rather than the join's own composite name) \u2014 use whichever calling convention is clearer for the caller; both now reach the same in-place-extend result for a keyed join. Prefer joinPaths when the goal is genuinely one multi-table view built in a single call, since chaining still needs one add_join call per additional table. joinType (per pair, or per joinPaths edge): INNER (default), LEFT, RIGHT, FULL, CROSS, MERGE. CROSS joins ignore key columns. MERGE joins match rows by position and is only valid for the two-table form (use add_merge_join for 3+ tables matched by position); joinPaths rejects MERGE per edge. CROSS is also restricted in joinPaths: it may only be used when it is the SOLE edge in the call (a cross join is an exclusive operation and cannot be combined with any other edge) \u2014 for 3+ tables where one pair should be cross-joined, do that pair as its own add_cross_join / single-edge add_join call and join the result into the rest separately. The key column(s) are verified against both tables before posting (except for CROSS/MERGE, which use none), so a key naming a column neither table has is refused here instead of silently producing a zero-column join that StyleBI later removes. Logical model entities do NOT expose foreign-key columns as attributes \u2014 use get_datasource_relationships to find the physical join path before joining two entities from the same model. IMPORTANT \u2014 cross-join safety: when chaining a 3rd+ table onto an existing join assembly (rather than using joinPaths), the join key column you reference must still be visible (not hidden) in the left table. If you get a 'cross join' error, check that the key column (e.g. CATEGORY_ID) is visible in the left assembly before adding the next join. Use set_column_visibility to restore it if needed.",
       {
         name: { type: "string" },
         leftTable: { type: "string", description: "Two-table form only." },
@@ -22732,7 +23126,7 @@ function makeWorksheetTools(deps) {
     ),
     {
       name: "add_table",
-      description: `Add a data table to the worksheet. For physical database tables: provide datasource + schema + table (use search_schema to discover them). For logical model entities: provide datasource + logicalModel + table (entity name) \u2014 use list_logical_models to discover available models and entities. For a REST/JSON connector endpoint with a predefined catalogue: provide datasource + endpoint (use list_endpoint_lookups to discover endpoints and their pre-built lookup chains, and check its hasEndpointCatalog flag first), and optionally lookup \u2014 an ordered chain of pre-built 'Join With' endpoint names (e.g. ["Issue Event"], or ["Repositories","Contributors"] for two levels); do not invent a chain, only ones the connector already ships can be selected this way. lookupExpandArrays/lookupTopLevelOnly tune how the last lookup's matched array expands into rows (default true/true). parameters (a map of the endpoint's own placeholder names to values) fills the endpoint's required/optional parameters \u2014 an endpoint with any required parameter cannot be called without it. For a GENERIC/CUSTOM REST-JSON datasource with no predefined endpoint catalogue (list_endpoint_lookups reports hasEndpointCatalog: false): provide datasource + suffix (a URL template, e.g. '/v1/widgets/{id}', filled from parameters) instead of endpoint, and optionally customLookups \u2014 an ordered list of up to 5 hand-authored lookup levels, each {url, jsonPath, key, ignoreBaseUrl}. Level i's url MUST contain the literal placeholder {paramN} where N = i+1 (1-indexed) to receive the id extracted via that level's own jsonPath+key from the PARENT level's row \u2014 StyleBI does not auto-name this placeholder from anything you write, it is always paramN by position; this tool rejects a customLookups entry whose url is missing its expected placeholder before sending anything. Unlike a named connector's endpoint, a custom suffix's {name} placeholders are not validated against a known parameter contract \u2014 any parameters entry not referenced by name in suffix is simply unused, not rejected as unknown. Do not combine endpoint/lookup with suffix/customLookups on the same call \u2014 pick one form. For either endpoint or custom-endpoint form: 'table' is used as the new table's name rather than a physical path, and the table has no columns until this call runs the live request (one real call to the connector's API). If the resolved endpoint/suffix/queryParams target paginates, maxRows is REQUIRED \u2014 StyleBI refuses to create the table without it, since every later render would otherwise page until the API runs out of data; a target that does not paginate does not require it, but the value is still honored as a fetch cap if supplied. Omit datasource to create an embedded table \u2014 but it is NOT created empty: StyleBI seeds every new embedded table with exactly 1 blank data row (its own default), with 0 visible columns until add_column is called. This tool's response reports that row count for this form. Use set_table_properties's rowCount argument right after creation to set an exact data-row count \u2014 it already accounts for the pre-seeded row.`,
+      description: `Add a data table to the worksheet. For physical database tables: provide datasource + schema + table (use search_schema to discover them). For logical model entities: provide datasource + logicalModel + table (entity name) \u2014 use list_logical_models to discover available models and entities. For a REST/JSON connector endpoint with a predefined catalogue: provide datasource + endpoint (use list_endpoint_lookups to discover endpoints and their pre-built lookup chains, and check its hasEndpointCatalog flag first), and optionally lookup \u2014 an ordered chain of pre-built 'Join With' endpoint names (e.g. ["Issue Event"], or ["Repositories","Contributors"] for two levels); do not invent a chain, only ones the connector already ships can be selected this way. lookupExpandArrays/lookupTopLevelOnly tune how the last lookup's matched array expands into rows (default true/true). parameters (a map of the endpoint's own placeholder names to values) fills the endpoint's required/optional parameters \u2014 an endpoint with any required parameter cannot be called without it. For a GENERIC/CUSTOM REST-JSON datasource with no predefined endpoint catalogue (list_endpoint_lookups reports hasEndpointCatalog: false): provide datasource + suffix (a URL template, e.g. '/v1/widgets/{id}', filled from parameters) instead of endpoint, and optionally customLookups \u2014 an ordered list of up to 5 hand-authored lookup levels, each {url, jsonPath, key, ignoreBaseUrl}. Level i's url MUST contain the literal placeholder {paramN} where N = i+1 (1-indexed) to receive the id extracted via that level's own jsonPath+key from the PARENT level's row \u2014 StyleBI does not auto-name this placeholder from anything you write, it is always paramN by position; this tool rejects a customLookups entry whose url is missing its expected placeholder before sending anything. Unlike a named connector's endpoint, a custom suffix's {name} placeholders are not validated against a known parameter contract \u2014 any parameters entry not referenced by name in suffix is simply unused, not rejected as unknown. Do not combine endpoint/lookup with suffix/customLookups on the same call \u2014 pick one form. For either endpoint or custom-endpoint form: 'table' is used as the new table's name rather than a physical path, and the table has no columns until this call runs the live request (one real call to the connector's API). If the resolved endpoint/suffix/queryParams target paginates, maxRows is REQUIRED \u2014 StyleBI refuses to create the table without it, since every later render would otherwise page until the API runs out of data; a target that does not paginate does not require it, but the value is still honored as a fetch cap if supplied. Omit datasource (and endpoint/suffix/queryParams) to create an embedded table \u2014 but it is NOT created empty: StyleBI seeds every new embedded table with exactly 1 blank data row (its own default), with 0 visible columns until add_column is called. This tool's response reports that row count for this form. Use set_table_properties's rowCount argument right after creation to set an exact data-row count \u2014 it already accounts for the pre-seeded row. This tool has NO form for referencing another SAVED WORKSHEET as a table/mirror source \u2014 use add_mirror's 'path' (+ optional 'scope') parameter for that; a bare 'table' value containing '/' is refused rather than silently creating an unrelated blank embedded table under that literal name.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -22839,7 +23233,13 @@ function makeWorksheetTools(deps) {
           );
         }
         assertCustomLookupUrlPlaceholders(a.customLookups);
-        const resolvedSuffix = a.suffix ? resolveSuffixPlaceholders(a.suffix, a.parameters) : a.suffix;
+        const isEmbeddedForm = !a.datasource && !a.endpoint && !a.suffix && !(a.queryParams && Object.keys(a.queryParams).length > 0);
+        if (isEmbeddedForm && a.table.includes("/")) {
+          throw new Error(
+            `add_table: 'table' (${JSON.stringify(a.table)}) contains '/', which no physical table, logical-model entity, or new embedded-table name can -- it looks like a saved-asset PATH instead. With no datasource/logicalModel/endpoint/suffix/queryParams given, this call would otherwise silently create a blank, unrelated EMBEDDED table literally named ${JSON.stringify(a.table)} rather than referencing what you meant. To add another SAVED WORKSHEET as a cross-worksheet table/mirror source, use add_mirror's 'path' (+ optional 'scope') parameter instead -- add_table has no such form.`
+          );
+        }
+        const resolvedSuffix = a.suffix ? resolveSuffixPlaceholders("add_table", a.suffix, a.parameters) : a.suffix;
         const request = {
           op: "add_table",
           table: a.table,
@@ -22879,6 +23279,139 @@ function makeWorksheetTools(deps) {
           }
         }
         return renamedNote ? { ok: true, note: renamedNote } : { ok: true };
+      }
+    },
+    {
+      name: "edit_table",
+      description: "Rewrite an existing tabular (REST/JSON connector) table's own query IN PLACE -- the edit_table counterpart of edit_sql_query for a SQL-bound table, and the fix for the gap where changing a REST/JSON table's endpoint/lookup/suffix/queryParams required delete_table + add_table, discarding the assembly's identity and refusing outright if anything depended on it (bug #76777). table names the EXISTING tabular assembly to rewrite -- its already-bound datasource is read from the table itself and cannot be changed here; to point at a different datasource, delete_table + add_table instead. Exactly one of the same three source forms add_table accepts: endpoint (+ optional parameters/lookup/lookupExpandArrays/lookupTopLevelOnly) for a named connector's pre-built endpoint catalogue; suffix (+ optional customLookups) for a generic/custom REST-JSON datasource; or queryParams for a METADATA/FILE/Rest.XML datasource with no endpoint/suffix shape \u2014 mutually exclusive with each other, same as add_table. maxRows and extraProperties work exactly as they do on add_table (maxRows is effectively required if the resolved endpoint/suffix/queryParams target paginates). The edit is refused, with NOTHING changed, if the live call to the new endpoint/suffix/queryParams returns no columns, or if the resulting column set would drop a column a dependent join/composite table still keys on -- read_worksheet_model's `sources` field on each table shows what references what.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          table: { type: "string", description: "The EXISTING tabular table assembly to rewrite." },
+          endpoint: { type: "string", description: "Pre-built endpoint name from the datasource connector's own catalogue (see list_endpoint_lookups). Mutually exclusive with suffix/queryParams." },
+          lookup: {
+            type: "array",
+            items: { type: "string" },
+            description: "Ordered chain of pre-built 'Join With' endpoint names to graft onto endpoint. Each name must be one of the CURRENT position's valid choices \u2014 list_endpoint_lookups reports them. Max depth 5. Only valid with endpoint."
+          },
+          lookupExpandArrays: { type: "boolean", description: "Only meaningful with lookup: whether the LAST lookup's matched array expands into extra rows. Omit to keep the connector's own default (true)." },
+          lookupTopLevelOnly: { type: "boolean", description: "Only meaningful with lookup and lookupExpandArrays: whether only the top-level array is expanded. Omit to keep the connector's own default (true)." },
+          parameters: {
+            type: "object",
+            additionalProperties: { type: "string" },
+            description: `Values for the endpoint's (or custom suffix's) own placeholders, name -> value, e.g. {"owner": "my-org"}. Only for the endpoint or suffix forms.`
+          },
+          suffix: { type: "string", description: "URL suffix template for a GENERIC/CUSTOM REST-JSON datasource with no predefined endpoint catalogue. Supports {name} placeholders filled from parameters. Mutually exclusive with endpoint/queryParams." },
+          customLookups: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                url: { type: "string", description: "Must contain the literal placeholder {paramN} for this level's position (N = 1-indexed position + 1)." },
+                jsonPath: { type: "string", description: "Selects the parent row's array/entity to iterate for this level." },
+                key: { type: "string", description: "Extracts each item's id from jsonPath, substituted into the NEXT level's {paramN}." },
+                ignoreBaseUrl: { type: "boolean", description: "True if url is a full URL rather than a suffix appended to the datasource's base URL. Default false." }
+              },
+              required: ["url"]
+            },
+            description: "Ordered custom 'Join With' lookup chain for suffix's endpoint. Max 5 entries. Only valid with suffix."
+          },
+          queryParams: {
+            type: "object",
+            additionalProperties: { type: ["string", "number", "boolean"] },
+            description: "Connector-specific property values, keyed by the connector's OWN property names \u2014 not a Composer-invented shape. Call get_tabular_query_contract first to learn the exact property names. Mutually exclusive with endpoint/suffix/parameters/lookup/customLookups/extraProperties."
+          },
+          extraProperties: {
+            type: "object",
+            additionalProperties: { type: ["string", "number", "boolean"] },
+            description: "Additional connector-specific properties to set alongside endpoint/suffix \u2014 e.g. a row-selection path (jsonPath for a JSON connector, xpath for Rest.XML), an expand-arrays toggle, a timeout, a request type, or pagination settings. Requires endpoint or suffix. Mutually exclusive with queryParams."
+          },
+          maxRows: { type: "number", description: "Row cap applied to the table's query \u2014 the same setting set_table_properties's maxRows writes, and add_table's own maxRows. Effectively REQUIRED when the resolved target paginates." }
+        },
+        required: ["table"]
+      },
+      call: async (a) => {
+        assertRequiredFields("edit_table", ["table"], a);
+        const hasQueryParams = a.queryParams != null && Object.keys(a.queryParams).length > 0;
+        const hasEndpoint = a.endpoint != null && a.endpoint.trim().length > 0;
+        const hasSuffix = a.suffix != null && a.suffix.trim().length > 0;
+        if (!hasQueryParams && !hasEndpoint && !hasSuffix) {
+          throw new Error(
+            "edit_table requires one of queryParams, endpoint, or suffix -- nothing to change was supplied."
+          );
+        }
+        if (hasQueryParams && (hasEndpoint || hasSuffix)) {
+          throw new Error(
+            "edit_table cannot carry queryParams together with endpoint or suffix -- choose exactly one edit_table form."
+          );
+        }
+        if (hasQueryParams && a.parameters && Object.keys(a.parameters).length > 0) {
+          throw new Error(
+            "edit_table cannot carry queryParams together with parameters -- choose exactly one edit_table form."
+          );
+        }
+        if (hasQueryParams && a.lookup && a.lookup.length > 0) {
+          throw new Error(
+            "edit_table cannot carry queryParams together with lookup -- choose exactly one edit_table form."
+          );
+        }
+        if (hasQueryParams && a.customLookups && a.customLookups.length > 0) {
+          throw new Error(
+            "edit_table cannot carry queryParams together with customLookups -- choose exactly one edit_table form."
+          );
+        }
+        if (hasQueryParams && a.extraProperties && Object.keys(a.extraProperties).length > 0) {
+          throw new Error(
+            "edit_table cannot carry queryParams together with extraProperties -- queryParams is already its own complete, self-sufficient form."
+          );
+        }
+        if (a.extraProperties && Object.keys(a.extraProperties).length > 0 && !hasEndpoint && !hasSuffix) {
+          throw new Error(
+            "edit_table's extraProperties requires endpoint or suffix -- use queryParams instead for a datasource addressed without an endpoint/suffix identity."
+          );
+        }
+        if (hasEndpoint && hasSuffix) {
+          throw new Error(
+            "edit_table cannot carry both endpoint and suffix -- choose the named-connector form (endpoint) or the custom form (suffix), not both."
+          );
+        }
+        if (hasSuffix && a.lookup && a.lookup.length > 0) {
+          throw new Error(
+            "edit_table's 'lookup' is only for the named-connector form (endpoint) -- for a custom suffix, use customLookups instead."
+          );
+        }
+        if (hasEndpoint && a.customLookups && a.customLookups.length > 0) {
+          throw new Error(
+            "edit_table's 'customLookups' is only for the custom form (suffix) -- for a named-connector endpoint, use lookup instead."
+          );
+        }
+        if (a.lookup && a.lookup.length > 5) {
+          throw new Error(`lookup has ${a.lookup.length} entries; a chain can be at most 5 levels deep.`);
+        }
+        if (a.customLookups && a.customLookups.length > 5) {
+          throw new Error(
+            `customLookups has ${a.customLookups.length} entries; a chain can be at most 5 levels deep.`
+          );
+        }
+        assertCustomLookupUrlPlaceholders(a.customLookups);
+        const resolvedSuffix = a.suffix ? resolveSuffixPlaceholders("edit_table", a.suffix, a.parameters) : a.suffix;
+        const request = {
+          op: "edit_table",
+          table: a.table,
+          endpoint: a.endpoint,
+          lookup: a.lookup,
+          lookupExpandArrays: a.lookupExpandArrays,
+          lookupTopLevelOnly: a.lookupTopLevelOnly,
+          parameters: a.suffix ? void 0 : a.parameters,
+          suffix: resolvedSuffix,
+          customLookups: a.customLookups,
+          queryParams: a.queryParams,
+          extraProperties: a.extraProperties,
+          maxRows: a.maxRows
+        };
+        const token = await requireSession3(deps);
+        await deps.wizClient.post(`/v1/agent/worksheet/${encodeURIComponent(token)}/edit`, request);
+        return { ok: true };
       }
     },
     makeEditTool(
@@ -22962,6 +23495,34 @@ function makeWorksheetTools(deps) {
       async (token, args) => {
         await assertEditJoinResolvable(deps, token, args);
       }
+    ),
+    makeEditTool(
+      "add_table_to_join",
+      "Add a table to an EXISTING keyed join assembly in place, keeping the join's own name/identity -- matching the Composer UI's native 'Edit Join -> add a table' action. Unlike add_join under a fresh name (which always NESTS the existing join as one source of a new, separate assembly), this extends `name` itself: it stays a single, flat, N-source join. existingTable must already be one of `name`'s own source tables (read_worksheet_model's `sources` field on `name` lists them) -- it is the side of the new edge that belongs to the join being extended; newTable is the table being added. For multi-key: use existingKeys/newKeys arrays. joinType is INNER (default), LEFT, RIGHT, or FULL -- CROSS and MERGE are refused (CROSS cannot combine with the join's other edges; a MERGE join is a distinct assembly type with no in-place-extend tool yet). The key column(s) are verified against both tables before posting, same as add_join.",
+      {
+        name: { type: "string", description: "The existing join assembly to extend." },
+        existingTable: { type: "string", description: "One of name's own current source tables." },
+        existingKey: { type: "string", description: "Single join key column on existingTable." },
+        newTable: { type: "string", description: "The table being added." },
+        newKey: { type: "string", description: "Single join key column on newTable." },
+        existingKeys: { type: "array", items: { type: "string" }, description: "Multi-key variant of existingKey." },
+        newKeys: { type: "array", items: { type: "string" }, description: "Multi-key variant of newKey." },
+        joinType: { type: "string", description: "INNER (default), LEFT, RIGHT, or FULL." }
+      },
+      ["name", "existingTable", "newTable"],
+      (a) => ({
+        op: "add_table_to_join",
+        name: a.name,
+        leftTable: a.existingTable,
+        leftKey: a.existingKey,
+        leftKeys: a.existingKeys,
+        rightTable: a.newTable,
+        rightKey: a.newKey,
+        rightKeys: a.newKeys,
+        joinType: a.joinType
+      }),
+      deps,
+      (token, args) => assertAddTableToJoinResolvable(deps, token, args)
     ),
     makeEditTool(
       "delete_table",
@@ -23061,18 +23622,44 @@ function makeWorksheetTools(deps) {
     ),
     makeEditTool(
       "add_mirror",
-      "Create a mirror (reference copy) of an existing table. The mirror inherits columns and data from the source and stays in sync. Use mirrors to apply different filters/aggregates to the same source data.",
+      `Create a mirror (reference copy) of an existing table. The mirror inherits columns and data from the source and stays in sync. Use mirrors to apply different filters/aggregates to the same source data.
+
+Two source forms, exactly one required: 'source' names an existing table ASSEMBLY already in the CURRENT worksheet (an ordinary same-worksheet mirror). 'path' (+ optional 'scope') instead names a SAVED WORKSHEET ASSET (e.g. "Sample Queries/customers") to mirror across worksheets \u2014 the same mechanism the Composer UI uses when a repository-tree worksheet is dragged onto the canvas; this cross-worksheet form mirrors the source worksheet's PRIMARY assembly, not a table you name within it. Only a cross-worksheet ('path') mirror can have its auto-update toggled off via set_mirror_auto_update \u2014 a same-worksheet mirror always tracks its source.`,
       {
         name: { type: "string", description: "Name for the new mirror assembly" },
-        source: { type: "string", description: "Name of the source table assembly to mirror" }
+        source: {
+          type: "string",
+          description: "Name of an existing table assembly in the CURRENT worksheet to mirror. Mutually exclusive with 'path'."
+        },
+        path: {
+          type: "string",
+          description: `Path of a SAVED WORKSHEET asset to mirror across worksheets, e.g. "Sample Queries/customers" \u2014 mirrors that worksheet's primary assembly. Mutually exclusive with 'source'.`
+        },
+        scope: {
+          type: "string",
+          enum: ["global", "user"],
+          description: `Where to resolve 'path': "global" (default) for the shared repository, "user" for the current user's private folder. Only meaningful together with 'path'.`
+        }
       },
-      ["name", "source"],
-      (a) => ({ op: "add_mirror", name: a.name, source: a.source }),
-      deps
+      ["name"],
+      (a) => ({ op: "add_mirror", name: a.name, source: a.source, path: a.path, scope: a.scope }),
+      deps,
+      async (_token, a) => {
+        if (a.source && a.path) {
+          throw new Error(
+            "add_mirror: 'source' and 'path' are mutually exclusive \u2014 'source' mirrors an existing assembly in the current worksheet, 'path' mirrors a saved worksheet asset. Pass exactly one."
+          );
+        }
+        if (!a.source && !a.path) {
+          throw new Error(
+            "add_mirror: requires either 'source' (same-worksheet) or 'path' (cross-worksheet)."
+          );
+        }
+      }
     ),
     {
       name: "add_sql_query",
-      description: "Create a new table from a freeform SQL query against a JDBC datasource. Use list_datasources to find available datasources first. If the user provides a SQL query, run it as-is \u2014 do not deconstruct it into visual tools unless explicitly asked to. When deciding how to fulfill a natural-language request (no SQL provided), prefer the visual tools (add_table + add_join + set_conditions + set_group_aggregate + set_ranking) because they produce a composable worksheet that users can inspect and modify in the UI.\n\nIMPORTANT \u2014 always give every projected column an explicit AS alias, even ones that look unambiguous (e.g. write `SELECT f.title AS title` not `SELECT f.title`). This is required, not stylistic: an unaliased QUALIFIED column (table_alias.column, no AS) inside a derived-table subquery that gets wrapped by an outer query \u2014 the standard pattern for window-function escape hatches like per-group ranking, e.g. `SELECT * FROM (SELECT f.title, ROW_NUMBER() OVER (...) AS rn FROM film f) ranked WHERE rn <= N` \u2014 hits a confirmed StyleBI engine bug (affects the built-in Composer SQL editor too, not just this tool) where the column is silently dropped from every result row instead of erroring. Explicit aliases on every column, in the INNERMOST subquery especially, fully avoid it.\n\nThe response's 'undeclaredVariables' array names any \"$(name)\" placeholder in the SQL text that has no matching worksheet variable yet \u2014 such a placeholder silently matches nothing (not an error) until the variable is declared. Call add_variable for each name listed, then set_variable_values, before trusting this table's data.\n\nNote: add_sql_query/edit_sql_query do not validate the query up front \u2014 an unsupported SQL feature (e.g. a window function this datasource's driver rejects) will not surface until preview_worksheet_data, and then only as a generic 'table not found or produced no data' error \u2014 see that tool's note.\n\nNote: dividing two aggregate/computed numeric expressions (e.g. two SUM(...) results) can silently return a truncated (non-fractional) result on this deployment's H2 2.2.224 Examples datasource. Wrap both operands in CAST(... AS DOUBLE) whenever a fractional ratio is expected, regardless of the source columns' declared type.\n\nNote: date/time literal filtering in WHERE clauses (bare 'yyyy-mm-dd' strings, DATE '...', and TIMESTAMP '...') is unreliable against this datasource across all three standard forms \u2014 prefer YEAR(col)/MONTH(col) integer extraction instead, which is confirmed to work reliably.\n\nNote: window functions (e.g. LAG(...) OVER (...), ROW_NUMBER() OVER (...)) are a specific case worth flagging: add_sql_query/edit_sql_query can accept one and return {ok:true} (StyleBI's own SQL parser understands the OVER (PARTITION BY ... ORDER BY ...) form), but the query can still fail later at preview_worksheet_data time even though it was accepted \u2014 do not treat {ok:true} at edit time as confirmation the query will actually run. When it does fail, the driver's reported error position (e.g. \"Encountered '(' at line 1, column N\") is not reliable for locating the problem in the SQL you submitted \u2014 it does not consistently correspond to any position in your original query text, so do not use it to count characters into your own SQL. Treat any failure mentioning the OVER clause as unresolved for now in this environment \u2014 rewrite around it (e.g. a correlated self-join or subquery instead of LAG/ROW_NUMBER) rather than trying to relocate and patch the reported column.\n\nNote: WITH ... AS (...) (common table expressions) are not supported at all: add_sql_query/edit_sql_query reject them immediately, before ever reaching preview_worksheet_data, with \"SQL could not be parsed or no columns detected \u2014 check syntax and table references.\" Rewrite the query without a CTE (e.g. inline the subquery directly, or use a derived table in the FROM clause: FROM (SELECT ...) t in place of WITH t AS (SELECT ...)) before submitting.",
+      description: "Create a new table from a freeform SQL query against a JDBC datasource. Use list_datasources to find available datasources first. If the user provides a SQL query, run it as-is \u2014 do not deconstruct it into visual tools unless explicitly asked to. When deciding how to fulfill a natural-language request (no SQL provided), prefer the visual tools (add_table + add_join + set_conditions + set_group_aggregate + set_ranking) because they produce a composable worksheet that users can inspect and modify in the UI.\n\nIMPORTANT \u2014 always give every projected column an explicit AS alias, even ones that look unambiguous (e.g. write `SELECT f.title AS title` not `SELECT f.title`). This is required, not stylistic: an unaliased QUALIFIED column (table_alias.column, no AS) inside a derived-table subquery that gets wrapped by an outer query \u2014 the standard pattern for window-function escape hatches like per-group ranking, e.g. `SELECT * FROM (SELECT f.title, ROW_NUMBER() OVER (...) AS rn FROM film f) ranked WHERE rn <= N` \u2014 hits a confirmed StyleBI engine bug (affects the built-in Composer SQL editor too, not just this tool) where the column is silently dropped from every result row instead of erroring. Explicit aliases on every column, in the INNERMOST subquery especially, fully avoid it.\n\nThe response's 'undeclaredVariables' array names any \"$(name)\" placeholder in the SQL text that has no matching worksheet variable yet \u2014 such a placeholder silently matches nothing (not an error) until the variable is declared. Call add_variable for each name listed, then set_variable_values, before trusting this table's data.\n\nNote: add_sql_query/edit_sql_query do not validate the query up front \u2014 an unsupported SQL feature (e.g. a window function this datasource's driver rejects) will not surface until preview_worksheet_data, and then only as a generic 'table not found or produced no data' error \u2014 see that tool's note.\n\nNote: dividing two aggregate/computed numeric expressions (e.g. two SUM(...) results) can silently return a truncated (non-fractional) result on most SQL engines when both operands' source columns are integer-typed (a double-typed source column on either side avoids it), though the condition can be non-obvious once expressions are nested. Wrap both operands in CAST(... AS DOUBLE) whenever a fractional ratio is expected \u2014 it's always safe regardless of whether truncation would actually occur.\n\nNote: date/time literal filtering in WHERE clauses (bare 'yyyy-mm-dd' strings, DATE '...', and TIMESTAMP '...') is unreliable against this datasource across all three standard forms \u2014 prefer YEAR(col)/MONTH(col) integer extraction instead, which is confirmed to work reliably.\n\nNote: window functions (e.g. LAG(...) OVER (...), ROW_NUMBER() OVER (...)) are a specific case worth flagging: add_sql_query/edit_sql_query can accept one and return {ok:true} (StyleBI's own SQL parser understands the OVER (PARTITION BY ... ORDER BY ...) form), but the query can still fail later at preview_worksheet_data time even though it was accepted \u2014 do not treat {ok:true} at edit time as confirmation the query will actually run. When it does fail, the driver's reported error position (e.g. \"Encountered '(' at line 1, column N\") is not reliable for locating the problem in the SQL you submitted \u2014 it does not consistently correspond to any position in your original query text, so do not use it to count characters into your own SQL. Treat any failure mentioning the OVER clause as unresolved for now in this environment \u2014 rewrite around it (e.g. a correlated self-join or subquery instead of LAG/ROW_NUMBER) rather than trying to relocate and patch the reported column.\n\nNote: WITH ... AS (...) (common table expressions) are not supported at all: add_sql_query/edit_sql_query reject them immediately, before ever reaching preview_worksheet_data, with \"SQL could not be parsed or no columns detected \u2014 check syntax and table references.\" Rewrite the query without a CTE (e.g. inline the subquery directly, or use a derived table in the FROM clause: FROM (SELECT ...) t in place of WITH t AS (SELECT ...)) before submitting.",
       inputSchema: {
         type: "object",
         properties: {
@@ -23375,7 +23962,7 @@ function makeWorksheetTools(deps) {
             groupOthers: { type: "boolean", description: "Group remaining rows as Others" },
             of: {
               type: "string",
-              description: "Optional aggregate column to rank 'field' by, when 'field' is a group/dimension column (matches the 'Of' picker in the worksheet composer's ranking condition editor). Omit when 'field' is itself the aggregate."
+              description: "Optional aggregate column to rank 'field' by, when 'field' is a group/dimension column (matches the 'Of' picker in the worksheet composer's ranking condition editor). Omit when 'field' is itself the aggregate. Requires the table to already be grouped via set_group_aggregate first -- 'of' has no group to rank against otherwise, and is rejected."
             }
           },
           required: ["field", "n", "operation"]
@@ -23397,7 +23984,7 @@ function makeWorksheetTools(deps) {
       // (e.g. "MIDDLE_N") reaches WorksheetMutationSupport.setRanking unchanged, which silently
       // treats anything other than the literal string "BOTTOM_N" as TOP_N with no error. Re-check
       // it here so a caller gets a clear rejection instead of a silently-wrong ranking direction.
-      async (_token, args) => {
+      async (token, args) => {
         const n = args.ranking?.n;
         if (typeof n === "number" && (!Number.isInteger(n) || n < 1)) {
           throw new Error(`set_ranking: 'ranking.n' needs an integer of at least 1, got ${n}.`);
@@ -23410,6 +23997,10 @@ function makeWorksheetTools(deps) {
             );
           }
           args.ranking.operation = canonical;
+          if (args.ranking.of) {
+            const model = await readModel(deps, token);
+            assertRankingOfRequiresGroup(model, args.table, args.ranking.of, "set_ranking");
+          }
         }
       }
     ),
@@ -23436,7 +24027,7 @@ function makeWorksheetTools(deps) {
               groupOthers: { type: "boolean", description: "Group remaining rows as Others" },
               of: {
                 type: "string",
-                description: "Optional aggregate column to rank 'field' by, when 'field' is a group/dimension column. Omit when 'field' is itself the aggregate."
+                description: "Optional aggregate column to rank 'field' by, when 'field' is a group/dimension column. Omit when 'field' is itself the aggregate. Requires the table to already be grouped via set_group_aggregate first -- 'of' has no group to rank against otherwise, and is rejected."
               }
             },
             required: ["field", "n", "operation"]
@@ -23448,7 +24039,8 @@ function makeWorksheetTools(deps) {
       deps,
       // Same per-entry guards as set_ranking (n floor, operation enum) -- see that tool's own
       // comment for why the schema-declared operation enum isn't enough on its own.
-      async (_token, args) => {
+      async (token, args) => {
+        let model;
         for (const ranking of args.rankings ?? []) {
           const n = ranking?.n;
           if (typeof n === "number" && (!Number.isInteger(n) || n < 1)) {
@@ -23461,6 +24053,10 @@ function makeWorksheetTools(deps) {
             );
           }
           if (ranking) ranking.operation = canonical;
+          if (ranking?.of) {
+            if (!model) model = await readModel(deps, token);
+            assertRankingOfRequiresGroup(model, args.table, ranking.of, "set_rankings");
+          }
         }
       }
     ),
@@ -23857,6 +24453,30 @@ function makeWorksheetTools(deps) {
       (a) => ({ op: "remove_concat_subtable", table: a.table, name: a.name }),
       deps
     ),
+    makeEditTool(
+      "edit_concatenation",
+      "Change the concatenation type (UNION/INTERSECT/MINUS) and/or duplicate-row (concatDistinct) setting of an EXISTING concatenation assembly, in place -- the tables it draws from are unchanged (use add_concat_subtable/remove_concat_subtable/reorder_concat_subtables for that). The new value(s) are applied to EVERY connection in this concatenation uniformly, not to one pair at a time: a concatenation can legally hold a different operation per adjacent pair (e.g. 'A UNION B MINUS C'), and this tool has no way to retarget just one connection -- calling it flattens the whole assembly to a single type/distinct setting, silently overwriting any such per-pair mixture. At least one of concatType/concatDistinct must be given.",
+      {
+        table: { type: "string", description: "Name of the existing concatenation assembly" },
+        concatType: {
+          type: "string",
+          enum: ["UNION", "INTERSECT", "MINUS"],
+          description: "New concatenation type, applied to every connection. Omit to leave the current type unchanged."
+        },
+        concatDistinct: {
+          type: "boolean",
+          description: "New duplicate-row setting, applied to every connection -- the difference between UNION and UNION ALL. Omit to leave the current setting unchanged."
+        }
+      },
+      ["table"],
+      (a) => ({ op: "edit_concatenation", table: a.table, concatType: a.concatType, concatDistinct: a.concatDistinct }),
+      deps,
+      async (_token, a) => {
+        if (a.concatType === void 0 && a.concatDistinct === void 0) {
+          throw new Error("edit_concatenation requires at least one of concatType or concatDistinct.");
+        }
+      }
+    ),
     // ----- Named group assembly -----
     makeEditTool(
       "add_named_group",
@@ -23961,7 +24581,7 @@ function makeWorksheetTools(deps) {
     // ----- Variable runtime input -----
     makeEditTool(
       "set_variable_values",
-      `Set runtime values for WORKSHEET-scoped variables (parameters) only. Variables must already exist (created via add_variable). After setting values, dependent tables are refreshed automatically. A value may be a plain string (single value) or an array of strings (assigns multiple values at once) \u2014 an array is valid only for a variable whose picker (add_variable's choices.displayStyle) is 'list' or 'checkboxes'; a 1-element array is treated the same as a plain string regardless of the variable's display style. Array elements must themselves be plain strings. A viewsheet's own prompted variables/parameters \u2014 the kind a viewsheet condition's {type: "variable"} value or an Input assembly's binding resolves against \u2014 are a separate, same-name-capable store this tool cannot reach or set; to set one of those, bind an Input assembly to it and use set_input_value instead.`,
+      `Set runtime values for WORKSHEET-scoped variables (parameters) only. Variables must already exist (created via add_variable). After setting values, dependent tables are refreshed automatically. A value may be a plain string (single value) or an array of strings (assigns multiple values at once) \u2014 an array is valid only for a variable whose picker (add_variable's choices.displayStyle) is 'list' or 'checkboxes'; a 1-element array is treated the same as a plain string regardless of the variable's display style. Array elements must themselves be plain strings. A viewsheet's own prompted variables/parameters \u2014 the kind a viewsheet condition's {type: "variable"} value or an Input assembly's binding resolves against \u2014 are a separate, same-name-capable store this tool cannot reach or set; to set one of those, use set_parameters (collect_parameters lists what is settable) \u2014 or, if it's already bound to an on-canvas Input assembly, set_input_value instead.`,
       {
         variableValues: {
           type: "object",
@@ -24020,16 +24640,42 @@ function makeWorksheetTools(deps) {
         );
       }
     },
-    makeEditTool(
-      "convert_to_embedded",
-      "Convert a bound (query-based) table to an embedded table. Executes the query and stores the result data inline. This is a one-way operation.",
-      {
-        table: { type: "string", description: "Bound table assembly name to convert" }
+    {
+      name: "convert_to_embedded",
+      description: "Snapshot a bound (query-based) table's current query result into a NEW embedded table, added alongside it \u2014 matching the Composer UI's own 'Convert to Embedded Table' action. The original table (`table`) is left fully intact and still live; the response's `embeddedTable` field carries the new table's actual name (StyleBI assigns it, not the caller) \u2014 use that name, not `table`, in subsequent calls against the snapshot. One-way in the sense that the new table will never update again.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          table: { type: "string", description: "Bound table assembly name to convert" }
+        },
+        required: ["table"]
       },
-      ["table"],
-      (a) => ({ op: "convert_to_embedded", table: a.table }),
-      deps
-    ),
+      // Custom (not makeEditTool): the resolved new table's name only exists in the POST
+      // response (WBS-054, #76753) -- makeEditTool discards the response and classifyDisclosure
+      // can only see the pre-call request, neither of which can name the new sibling table.
+      call: async (a) => {
+        assertRequiredFields("convert_to_embedded", ["table"], a);
+        const token = await requireSession3(deps);
+        const editResponse = await deps.wizClient.post(
+          `/v1/agent/worksheet/${encodeURIComponent(token)}/edit`,
+          { op: "convert_to_embedded", table: a.table }
+        );
+        if (!editResponse || typeof editResponse !== "object" || !editResponse.assemblyName) {
+          throw new Error(
+            `convert_to_embedded: server did not report the new embedded table's name for "${a.table}". This tool can no longer confirm "${a.table}" was left untouched and a new sibling snapshot table was created -- call read_worksheet_model to check what actually happened before relying on this call having succeeded.`
+          );
+        }
+        return {
+          ok: true,
+          embeddedTable: editResponse.assemblyName,
+          disclosure: disclosure(
+            editResponse.assemblyName,
+            "meaning",
+            `${editResponse.assemblyName} is a new frozen, point-in-time snapshot of '${a.table}' at the time of this call \u2014 '${a.table}' itself is unchanged and still live. Nothing distinguishes the new table from a live one on screen.`
+          )
+        };
+      }
+    },
     {
       name: "get_query_plan",
       description: "Get the SQL query string for a SQL-bound table. Returns the generated SQL that would be executed against the database.",
@@ -24094,7 +24740,7 @@ function makeWorksheetTools(deps) {
 
 The response's 'undeclaredVariables' array names any "$(name)" placeholder in the new SQL text that has no matching worksheet variable yet \u2014 such a placeholder silently matches nothing (not an error) until the variable is declared. Call add_variable for each name listed, then set_variable_values, before trusting this table's data.
 
-Note: dividing two aggregate/computed numeric expressions (e.g. two SUM(...) results) can silently return a truncated (non-fractional) result on this deployment's H2 2.2.224 Examples datasource. Wrap both operands in CAST(... AS DOUBLE) whenever a fractional ratio is expected, regardless of the source columns' declared type.
+Note: dividing two aggregate/computed numeric expressions (e.g. two SUM(...) results) can silently return a truncated (non-fractional) result on most SQL engines when both operands' source columns are integer-typed (a double-typed source column on either side avoids it), though the condition can be non-obvious once expressions are nested. Wrap both operands in CAST(... AS DOUBLE) whenever a fractional ratio is expected \u2014 it's always safe regardless of whether truncation would actually occur.
 
 Note: date/time literal filtering in WHERE clauses (bare 'yyyy-mm-dd' strings, DATE '...', and TIMESTAMP '...') is unreliable against this datasource across all three standard forms \u2014 prefer YEAR(col)/MONTH(col) integer extraction instead, which is confirmed to work reliably.
 
@@ -24169,7 +24815,7 @@ Note: WITH ... AS (...) (common table expressions) are not supported at all: add
     },
     {
       name: "delete_variable",
-      description: "Delete a variable assembly from the worksheet. A condition or expression still spelling $(name) is left behind pointing at nothing \u2014 the table it filters keeps returning the variable's last resolved value and reports no error. This tool reads the worksheet back after the delete and lists every such site in 'danglingReferences'.",
+      description: "Delete a variable assembly from the worksheet. If the variable is still referenced by a condition or expression that StyleBI's own dependency graph tracks (e.g. a filter using $(name), a JS/SQL expression column, or a SQL-bound table's query parameter), the delete is refused with an error and the variable is left in place \u2014 matching the native Composer UI's own delete-with-dependents behavior. Remove or rewrite those references first (set_conditions/edit_expression), then retry. This tool still reads the worksheet back after a successful delete and reports any remaining $(name) sites via 'danglingReferences' as a defensive fallback.",
       inputSchema: {
         type: "object",
         properties: {
@@ -24374,6 +25020,43 @@ Note: WITH ... AS (...) (common table expressions) are not supported at all: add
       }
     },
     {
+      name: "export_worksheet_table",
+      description: "Export a single worksheet table's full data to a downloadable CSV file, written to a local file on the machine running this MCP server -- the same underlying streamed-straight-to-disk mechanism as export_viewsheet, but for one worksheet table instead of a whole viewsheet. Unlike preview_worksheet_data (capped at 200 rows, for spot-checking a query before saving), this exports every row (up to the server's row cap) as a real CSV file, never round-tripped through this tool's JSON response.\n\nExports the table's CURRENT LIVE state in this session, including any unsaved edits -- it does not require save_worksheet first and does not read a stale, previously-saved copy.\n\n`savePath` (optional) names the DIRECTORY to save into \u2014 never a full file path with a name of its own. Defaults to this machine's Downloads folder. A name collision with an earlier export in the same directory gets ' (1)', ' (2)', etc. appended rather than silently overwriting it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          table: { type: "string", description: "Table assembly name to export." },
+          savePath: {
+            type: "string",
+            description: "Directory to save the exported file into (not a full file path). Defaults to this machine's Downloads folder. Created if it doesn't already exist."
+          }
+        },
+        required: ["table"]
+      },
+      call: async (args) => {
+        const token = await requireSession3(deps);
+        const dir = args.savePath ?? defaultExportDir();
+        const provisionalDest = nodePath2.join(
+          dir,
+          `export-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`
+        );
+        const downloaded = await deps.wizClient.downloadToFile(
+          `/v1/agent/worksheet/${encodeURIComponent(token)}/export?table=${encodeURIComponent(args.table)}`,
+          provisionalDest,
+          { timeoutMs: IMAGE_TIMEOUT_MS }
+        );
+        const fileName = downloaded.fileName ?? `${args.table}.csv`;
+        const filePath = claimUniqueDest(dir, fileName, provisionalDest);
+        return {
+          filePath,
+          fileName: nodePath2.basename(filePath),
+          mimeType: downloaded.mimeType ?? "text/csv",
+          byteLength: downloaded.byteLength,
+          summary: `Exported worksheet table '${args.table}' to CSV and saved it to ${filePath} (${downloaded.byteLength.toLocaleString()} bytes).`
+        };
+      }
+    },
+    {
       name: "list_worksheet_dependents",
       description: "List the saved viewsheets and other worksheets that currently depend on the connected worksheet \u2014 i.e. would need attention or would break if it were removed or structurally changed.\n\nUse this BEFORE deciding whether a request that says \"other dashboards share this worksheet, don't touch it\" is actually true, and before choosing whether a new data need should be met on the worksheet itself (affects every dependent) or scoped to just the connected viewsheet instead (e.g. a viewsheet-side calcField) \u2014 don't just take the user's claim on faith, check it.\n\nBacked by the same dependency check StyleBI's own Portal runs before deleting a dataset, not something this plugin infers or guesses \u2014 so it only reports OTHER saved assets that reference this one, not the tables/joins/columns inside this worksheet.\n\nAn unsaved worksheet (one that has never been saved) always reports `saved: false` with an empty `dependents` list, since nothing can point at an asset that doesn't exist yet \u2014 that is not the same as \"nothing depends on it\" once it IS saved.",
       inputSchema: { type: "object", properties: {} },
@@ -24409,7 +25092,7 @@ Column headers must use only the characters StyleBI allows in a column name: let
           delimiterTab: { type: "boolean", description: "Use a tab as the field separator, overriding 'delimiter'." },
           detectType: { type: "boolean", description: 'Convert values to a detected type (default true). Pass false to keep every column as text \u2014 that is how a value like "$499.99" survives a column that is otherwise numeric, instead of becoming null.' },
           firstRowAsHeader: { type: "boolean", description: "Take column names from line 1 (default true). When false, names become col0, col1, \u2026 and line 1 is kept as data." },
-          removeQuotes: { type: "boolean", description: "Strip a value's surrounding quotes, treating them as escaping rather than content (default false)." },
+          removeQuotes: { type: "boolean", description: "Strip a value's surrounding quotes, treating them as escaping rather than content (default true)." },
           unpivot: { type: "boolean", description: "Reshape crosstab-shaped input into a tabular table: the measure columns become name/value pairs. Set headerCols to say how many leading columns are row identifiers." },
           headerCols: { type: "number", description: "With unpivot, how many leading columns stay as row identifiers (default 1). Ignored when unpivot is false." },
           stringColumns: {
@@ -25306,6 +25989,46 @@ function normalizeFormatType(value) {
     `set_format: 'format.format' must be a recognized format type; got '${value}'. Accepted: ${CANONICAL_FORMAT_TYPES.join(", ")} (aliases like 'currency', 'percent', 'decimal', 'number', 'date', 'time', 'datetime', 'message' and 'duration' are also accepted). StyleBI stores an unrecognized value verbatim and silently renders no format at all, so this would have reported success without changing anything.`
   );
 }
+var DYNAMIC_FORMAT_COLOR_KEYS = ["color", "backgroundColor"];
+function checkFormatColorSyntax(out) {
+  for (const key of DYNAMIC_FORMAT_COLOR_KEYS) {
+    const value = out[key];
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed.startsWith("$(")) {
+      extractComponentReference(value, `'format.${key}'`);
+    } else if (trimmed.startsWith("=") && trimmed.slice(1).trim() === "") {
+      throw new Error(
+        `set_format: 'format.${key}' is "=" with no expression after it -- a script value needs a JS expression following the '=', e.g. "=Tab1.selectedObject == 'A' ? 'red' : 'blue'". StyleBI stores an empty script value as-is and resolves it to nothing, so this would have reported success without changing anything.`
+      );
+    }
+  }
+}
+async function resolveFormatDynamicRefs(deps, token, format) {
+  if (format === null || typeof format !== "object" || Array.isArray(format)) return;
+  const record = format;
+  const refs = /* @__PURE__ */ new Map();
+  for (const key of DYNAMIC_FORMAT_COLOR_KEYS) {
+    const value = record[key];
+    if (typeof value !== "string") continue;
+    const name = extractComponentReference(value, `'format.${key}'`);
+    if (name !== null) {
+      const keys = refs.get(name);
+      if (keys) keys.push(key);
+      else refs.set(name, [key]);
+    }
+  }
+  if (refs.size === 0) return;
+  const model = await deps.wizClient.get(path5(token, "model"));
+  const assemblies = model?.assemblies ?? [];
+  for (const [name, keys] of refs) {
+    requireResolvableComponentReference(
+      name,
+      keys.length === 1 ? `'format.${keys[0]}'` : keys.map((k) => `'format.${k}'`).join(", "),
+      assemblies
+    );
+  }
+}
 function normalizeFormat(format) {
   if (format === null || format === void 0) {
     return format;
@@ -25315,11 +26038,17 @@ function normalizeFormat(format) {
   }
   const record = format;
   let out = record;
+  checkFormatColorSyntax(out);
   if ("format" in record && typeof record.format === "string") {
     const canonicalFormat = normalizeFormatType(record.format);
     if (canonicalFormat === "CurrencyFormat" && typeof record.formatSpec === "string" && record.formatSpec.trim() !== "") {
       throw new Error(
         `set_format: 'formatSpec' (got '${record.formatSpec}') has no effect on 'CurrencyFormat' -- its symbol/pattern is derived entirely from the locale, not from 'formatSpec'. Use 'DecimalFormat' with a quoted literal instead, e.g. formatSpec: "'$'#,##0.00", to force a specific symbol/pattern.`
+      );
+    }
+    if (canonicalFormat === "PercentFormat" && typeof record.formatSpec === "string" && record.formatSpec.trim() !== "") {
+      throw new Error(
+        `set_format: 'formatSpec' (got '${record.formatSpec}') has no effect on 'PercentFormat' -- it is a fixed built-in display (matching the Composer's own Format dialog, which offers no decimal-places control for this type), not a customizable pattern. Use 'DecimalFormat' with a percent-literal pattern instead, e.g. formatSpec: "0.00%", to control decimal places.`
       );
     }
     out = { ...out, format: canonicalFormat };
@@ -25345,7 +26074,7 @@ function normalizeFormat(format) {
 function makeSetFormatTool(deps) {
   return {
     name: "set_format",
-    description: "Apply formatting to one or more assemblies \u2014 colour, background, font, alignment, borders, number format. Pass reset:true to clear formatting back to the default instead of applying a format.\n\n'target' scopes what gets formatted: 'object' (default) is the whole assembly \u2014 for a chart, this includes the default text style that unstyled axis titles and tick labels fall back to, so a font/color set this way is visible there too. 'title' formats only that assembly's own title-bar text (the bar above a chart, table, gauge, crosstab, etc.) and nothing else \u2014 for a chart this is separate from the x/y axis titles, which are set_chart_region_properties {region: 'title', target: 'x'|'x2'|'y'|'y2'}. 'text' formats a single chart's text-aesthetic-bound field (its data labels) \u2014 requires 'field' and exactly one assembly.",
+    description: "Apply formatting to one or more assemblies \u2014 colour, background, font, alignment, borders, number format. Pass reset:true to clear formatting back to the default instead of applying a format.\n\n'target' scopes what gets formatted: 'object' (default) is the whole assembly \u2014 for a chart, this includes the default text style that unstyled axis titles and tick labels fall back to, so a font/color set this way is visible there too. For a Rectangle, Line, or Oval shape, 'object' is also the *only* way to set that shape's own line/fill color \u2014 there is no separate shape-specific tool: 'color' is the shape's line/border color, and 'backgroundColor' is a Rectangle/Oval's fill color (a Line has no fill). 'title' formats only that assembly's own title-bar text (the bar above a chart, table, gauge, crosstab, etc.) and nothing else \u2014 for a chart this is separate from the x/y axis titles, which are set_chart_region_properties {region: 'title', target: 'x'|'x2'|'y'|'y2'}. 'text' formats a single chart's text-aesthetic-bound field (its data labels) \u2014 requires 'field' and exactly one assembly.",
     inputSchema: {
       type: "object",
       properties: {
@@ -25356,7 +26085,9 @@ function makeSetFormatTool(deps) {
         },
         format: {
           type: "object",
-          description: `CSS-shaped format: color, backgroundColor, font, align, format/formatSpec, borderTopStyle/Color/Width and the other three sides, roundCorner, wrapText. 'font' takes either the CSS shorthand '[italic] [bold] <size> <family>' \u2014 e.g. 'bold 14px Arial' \u2014 or the object form {fontFamily, fontSize, fontWeight, fontStyle, fontUnderline, fontStrikethrough}. Sizes are absolute points; a relative unit like 1.5em is refused rather than silently stored as 1.5. 'format' names the number/date format type \u2014 CurrencyFormat, PercentFormat, DecimalFormat, DateFormat, TimeFormat, MessageFormat, DurationFormat (natural aliases like 'currency', 'percent', 'decimal', 'number', 'date' are also accepted and canonicalized) \u2014 paired with 'formatSpec', a pattern like "'$'#,##0.00" for DecimalFormat. CurrencyFormat's symbol/pattern is derived entirely from the locale, so it rejects a non-empty 'formatSpec' rather than silently ignoring it.`
+          description: `CSS-shaped format: color, backgroundColor, font, align, format/formatSpec, borderTopStyle/Color/Width and the other three sides, roundCorner, wrapText. On a Rectangle/Line/Oval shape, 'color' is that shape's own line/border color and 'backgroundColor' is its fill color (Rectangle/Oval only) \u2014 this is the entry point for a shape's own color, not just the general per-assembly color scheme. 'font' takes either the CSS shorthand '[italic] [bold] <size> <family>' \u2014 e.g. 'bold 14px Arial' \u2014 or the object form {fontFamily, fontSize, fontWeight, fontStyle, fontUnderline, fontStrikethrough}. Sizes are absolute points; a relative unit like 1.5em is refused rather than silently stored as 1.5. 'format' names the number/date format type \u2014 CurrencyFormat, PercentFormat, DecimalFormat, DateFormat, TimeFormat, MessageFormat, DurationFormat (natural aliases like 'currency', 'percent', 'decimal', 'number', 'date' are also accepted and canonicalized) \u2014 paired with 'formatSpec', a pattern like "'$'#,##0.00" for DecimalFormat. CurrencyFormat's symbol/pattern is derived entirely from the locale, so it rejects a non-empty 'formatSpec' rather than silently ignoring it. PercentFormat is likewise a fixed built-in display (no decimal-places control, matching the Composer's own Format dialog) and also rejects a non-empty 'formatSpec' \u2014 use 'DecimalFormat' with a percent-literal pattern instead, e.g. formatSpec: "0.00%", to control decimal places.
+
+**'color'/'backgroundColor' may also be \`"$(ComponentName)"\`** \u2014 binds the color to a CheckBox, ComboBox, RadioButton, Slider, Spinner, or TextInput assembly's live value instead of a fixed literal, the same convention set_assembly_properties' 'visible'/'enabled' use. \`ComponentName\` must name an existing assembly of one of those six types \u2014 a typo, a deleted assembly, or a reference to a non-input assembly is refused rather than saved and silently rendered wrong. Or \`"=<script>"\` \u2014 a JS expression (the same engine execute_script runs against, not a SQL expression) evaluated live in the viewsheet's script scope, e.g. "=Tab1.selectedObject == 'A' ? 'red' : 'blue'". Any other string is an unconstrained literal CSS color, unchanged.`
         },
         reset: { type: "boolean", description: "Clear formatting rather than applying one." },
         target: {
@@ -25393,6 +26124,7 @@ function makeSetFormatTool(deps) {
       }
       const format = args.format === void 0 ? null : normalizeFormat(args.format) ?? null;
       const token = await requireSession4(deps);
+      await resolveFormatDynamicRefs(deps, token, format);
       await deps.wizClient.post(
         path5(token, "format"),
         {
@@ -25499,13 +26231,13 @@ function resolveExportFormat(format) {
   );
 }
 function defaultExportDir() {
-  return nodePath2.join(os.homedir(), "Downloads");
+  return nodePath3.join(os.homedir(), "Downloads");
 }
 function claimUniqueDest(dir, fileName, fromPath) {
-  const ext = nodePath2.extname(fileName);
+  const ext = nodePath3.extname(fileName);
   const base = fileName.slice(0, fileName.length - ext.length);
   for (let i = 0; i < 1e3; i++) {
-    const candidate = i === 0 ? nodePath2.join(dir, fileName) : nodePath2.join(dir, `${base} (${i})${ext}`);
+    const candidate = i === 0 ? nodePath3.join(dir, fileName) : nodePath3.join(dir, `${base} (${i})${ext}`);
     try {
       fs4.linkSync(fromPath, candidate);
       fs4.unlinkSync(fromPath);
@@ -25561,7 +26293,7 @@ function makeExportViewsheetTool(deps) {
       }
       if (args.current !== void 0) params.set("current", String(args.current));
       const dir = args.savePath ?? defaultExportDir();
-      const provisionalDest = nodePath2.join(
+      const provisionalDest = nodePath3.join(
         dir,
         `export-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`
       );
@@ -25574,7 +26306,7 @@ function makeExportViewsheetTool(deps) {
       const filePath = claimUniqueDest(dir, fileName, provisionalDest);
       return {
         filePath,
-        fileName: nodePath2.basename(filePath),
+        fileName: nodePath3.basename(filePath),
         mimeType: downloaded.mimeType ?? EXPORT_MIME_TYPES[format],
         byteLength: downloaded.byteLength,
         format,
@@ -25642,7 +26374,7 @@ function makeAttachBaseWorksheetTool(deps) {
     name: "attach_base_worksheet",
     description: `Attach an existing worksheet, logical model, or physical table as the connected viewsheet's base, when it currently has none. This is what gives a freshly-created, baseless viewsheet a data source at all \u2014 after this call, open_base_worksheet (worksheet type only)/list_bindable_fields/set_chart_source/set_table_source can see and use the attached source's fields.
 
-Refuses if the viewsheet already has a base \u2014 this only fills an empty base, it never repoints or replaces an existing one (use the Composer's own Viewsheet Properties dialog for that).
+Refuses if the viewsheet already has a base, unless force:true is passed \u2014 repointing discards existing assembly bindings (to fields/tables) that do not survive on the new source.
 
 If the goal is a second, unrelated dataset alongside the existing base \u2014 not replacing it \u2014 no base change is needed: an assembly's own source binding (set_table_source/set_chart_source) is independent of the viewsheet's base. A calc_table (add_assembly type:"calc_table") can pull that second dataset via update_script(kind:"viewsheetOnInit") calling runQuery() against a Data Worksheet only \u2014 runQuery() cannot query a logical model or physical table directly; build a worksheet first if the dataset isn't already in one.
 
@@ -25671,6 +26403,10 @@ Does NOT persist the viewsheet \u2014 like every other viewsheet-domain tool, it
         table: {
           type: "string",
           description: `Physical table name within 'datasource'. Required when type is "physicalTable".`
+        },
+        force: {
+          type: "boolean",
+          description: "Required to repoint a viewsheet that already has a base to a different source. Existing assembly bindings that do not survive on the new source are cleared."
         }
       }
     },
@@ -25705,12 +26441,131 @@ Does NOT persist the viewsheet \u2014 like every other viewsheet-domain tool, it
         body.datasource = args.datasource ?? null;
         body.table = args.table ?? null;
       }
+      const forceOmitted = args.force === void 0 || args.force === null;
+      const force = forceOmitted ? void 0 : normalizeForce(args.force, "attach_base_worksheet");
+      if (force !== void 0) {
+        body.force = force;
+      }
       await deps.wizClient.post(path5(token, "attach-base-worksheet"), body);
       const label = type === "physicalTable" ? `${args.datasource}.${args.table}` : args.path;
       return {
         ok: true,
-        message: `Attached "${label}" (${type}) as the viewsheet's base worksheet.`
+        message: force ? `Attached "${label}" (${type}) as the viewsheet's base worksheet. If it already had a base worksheet, it was repointed to this one, and any existing assembly bindings that do not survive on the new source were cleared.` : `Attached "${label}" (${type}) as the viewsheet's base worksheet.`
       };
+    }
+  };
+}
+function makeSetViewsheetDataSourceTool(deps) {
+  return {
+    name: "set_viewsheet_data_source",
+    description: `Rebind or clear the connected viewsheet's own Data Source \u2014 the Composer's Viewsheet Options dialog "Select"/"Clear" buttons (Redmine #76739).
+
+Unlike attach_base_worksheet, which only ever fills an EMPTY base and refuses otherwise, this always REPLACES whatever base is currently set, or clears it entirely \u2014 exactly what the dialog itself allows.
+
+Pass clear:true alone to remove the base (matching the dialog's "Clear" button); pass 'path' (worksheet/logicalModel) or 'datasource'+'table' (physicalTable) alone to set a new one instead. The two are mutually exclusive.
+
+Replacing an already-attached base changes what every existing assembly binds against \u2014 verify with read_viewsheet_model / list_bindable_fields afterward.
+
+Does NOT persist the viewsheet \u2014 like every other viewsheet-domain tool, it only updates this session's in-memory state. Call save_viewsheet separately once ready.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        clear: {
+          type: "boolean",
+          description: `true removes the viewsheet's base entirely, matching the dialog's "Clear" button. Cannot be combined with any other field.`
+        },
+        path: {
+          type: "string",
+          description: 'Path of the worksheet/logical-model asset to attach, e.g. "Sample Queries/customers" (worksheet) or "MyDataSource/MyModel" (logicalModel). Not used for type:"physicalTable" \u2014 use datasource/table instead.'
+        },
+        scope: {
+          type: "string",
+          enum: ["global", "user"],
+          description: `Where to resolve 'path': "global" (default) for the shared repository, "user" for the current user's private folder. Ignored for physicalTable.`
+        },
+        type: {
+          type: "string",
+          enum: ["worksheet", "logicalModel", "physicalTable"],
+          description: 'Kind of source to attach. Defaults to "worksheet" when omitted. "query" is a deprecated source type and is not supported.'
+        },
+        datasource: {
+          type: "string",
+          description: 'Data source name. Required when type is "physicalTable".'
+        },
+        table: {
+          type: "string",
+          description: `Physical table name within 'datasource'. Required when type is "physicalTable".`
+        }
+      }
+    },
+    call: async (args) => {
+      if (args.type === "query") {
+        throw new Error(
+          'set_viewsheet_data_source: type:"query" is a deprecated source type and is not supported.'
+        );
+      }
+      const token = await requireSession4(deps);
+      const clear = args.clear === true;
+      if (clear) {
+        if (args.path || args.scope || args.type || args.datasource || args.table) {
+          throw new Error(
+            "set_viewsheet_data_source: 'clear' cannot be combined with 'path'/'scope'/'type'/'datasource'/'table' \u2014 pass clear:true alone to remove the base, or the source fields alone to set one."
+          );
+        }
+        await deps.wizClient.post(path5(token, "set-data-source"), { clear: true });
+        return { ok: true, message: "Cleared the viewsheet's data source." };
+      }
+      const type = args.type ?? "worksheet";
+      if (type === "physicalTable") {
+        if (!args.datasource) {
+          throw new Error(
+            `set_viewsheet_data_source: type:"physicalTable" requires 'datasource'.`
+          );
+        }
+        if (!args.table) {
+          throw new Error(`set_viewsheet_data_source: type:"physicalTable" requires 'table'.`);
+        }
+      } else if (!args.path) {
+        throw new Error(
+          `set_viewsheet_data_source: type:"${type}" requires 'path', or pass clear:true.`
+        );
+      } else if (args.datasource || args.table) {
+        throw new Error(
+          `set_viewsheet_data_source: 'datasource'/'table' only apply to type:"physicalTable" \u2014 pass type:"physicalTable" or drop these fields.`
+        );
+      }
+      const body = {
+        path: args.path ?? null,
+        scope: args.scope ?? null
+      };
+      if (args.type) {
+        body.type = args.type;
+        body.datasource = args.datasource ?? null;
+        body.table = args.table ?? null;
+      }
+      await deps.wizClient.post(path5(token, "set-data-source"), body);
+      const label = type === "physicalTable" ? `${args.datasource}.${args.table}` : args.path;
+      return {
+        ok: true,
+        message: `Set "${label}" (${type}) as the viewsheet's data source.`
+      };
+    }
+  };
+}
+function makeConvertDataSourceToWorksheetTool(deps) {
+  return {
+    name: "convert_data_source_to_worksheet",
+    description: `The Composer's Viewsheet Options dialog "Convert Source to Worksheet" action (Redmine #76739), for a viewsheet whose data source is a Logical Model. Saves a brand-new, editable worksheet asset built from the model's query and returns its path.
+
+Like the dialog's own action, this only SAVES the new worksheet asset \u2014 it does not rebind the viewsheet to it. Call set_viewsheet_data_source with the returned 'path' (type:"worksheet") to actually attach it as the viewsheet's base.
+
+Refuses if the viewsheet's current data source is not a logical model, or if the viewsheet has never been saved.
+
+'hasMaterializedViews' in the response is true when this viewsheet has materialized views that switching away from the logical model would invalidate \u2014 the Composer shows a confirmation dialog for that; there is no one here to click through it, so treat true as a prompt to confirm with the user before calling set_viewsheet_data_source.`,
+    inputSchema: { type: "object", properties: {} },
+    call: async () => {
+      const token = await requireSession4(deps);
+      return deps.wizClient.post(path5(token, "convert-data-source-to-worksheet"), {});
     }
   };
 }
@@ -26144,6 +26999,8 @@ function makeViewsheetTools(deps) {
     makeExportViewsheetTool(deps),
     makeSaveViewsheetTool(deps),
     makeAttachBaseWorksheetTool(deps),
+    makeSetViewsheetDataSourceTool(deps),
+    makeConvertDataSourceToWorksheetTool(deps),
     makeCreateViewsheetTool(deps),
     makeCreateWorksheetTool(deps),
     makeAddCalcFieldTool(deps),
@@ -26200,6 +27057,159 @@ function requireOpFields(op, args) {
       );
     }
   }
+}
+
+// src/tools/hierarchyDimensionTools.ts
+var DATE_LEVELS2 = ["year", "quarter", "month", "week", "day", "hour", "minute", "second"];
+function requireColumns(raw) {
+  if (typeof raw === "string" && raw.includes(",")) {
+    throw new Error(
+      `'columns' must be an array of column names, got a single comma-separated string (${JSON.stringify(raw)}) \u2014 did you mean to pass multiple names as separate array entries, e.g. ["Country", "State", "City"]?`
+    );
+  }
+  const list = Array.isArray(raw) ? raw : raw === void 0 ? [] : [raw];
+  if (list.length === 0) {
+    throw new Error(
+      `add_hierarchy_dimension requires 'columns' \u2014 the column names for each level, outermost first, e.g. ["Country", "State", "City"].`
+    );
+  }
+  return list.map((entry) => {
+    if (typeof entry !== "string" || entry.trim() === "") {
+      throw new Error(`'columns' contains a non-string or blank entry: ${JSON.stringify(entry)}.`);
+    }
+    return entry.trim();
+  });
+}
+function normalizeDateLevels(raw, columnCount) {
+  if (raw === void 0) {
+    return void 0;
+  }
+  const list = Array.isArray(raw) ? raw : [raw];
+  if (list.length > columnCount) {
+    throw new Error(
+      `'dateLevels' has ${list.length} entries but 'columns' has ${columnCount} \u2014 dateLevels is positional, one entry per column (or fewer, with the rest treated as no grouping).`
+    );
+  }
+  return list.map((entry) => {
+    if (entry === void 0 || entry === null || entry === "") {
+      return "";
+    }
+    if (typeof entry !== "string") {
+      throw new Error(`'dateLevels' contains a non-string entry: ${JSON.stringify(entry)}.`);
+    }
+    const level = entry.trim().toLowerCase();
+    if (level !== "" && !DATE_LEVELS2.includes(level)) {
+      throw new Error(
+        `'${entry}' is not a date level. Use one of: ${DATE_LEVELS2.join(", ")}, or omit it.`
+      );
+    }
+    return level;
+  });
+}
+function requireIndex(raw) {
+  const value = typeof raw === "string" && raw.trim() !== "" ? Number(raw.trim()) : raw;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(
+      `remove_hierarchy_dimension requires 'index' \u2014 the whole number list_hierarchy_dimensions reports, got ${JSON.stringify(raw)}.`
+    );
+  }
+  return value;
+}
+function makeListHierarchyDimensionsTool(deps) {
+  return {
+    name: "list_hierarchy_dimensions",
+    description: "List a chart or crosstab's custom drill hierarchy dimensions \u2014 the Hierarchy tab of its Properties dialog.\n\nEach entry reports the `index` remove_hierarchy_dimension takes and its `members`, in order (outermost first), each with the `column` it drills on and its `dateLevel` (`none` unless the column is date-grouped). `availableColumns` is what add_hierarchy_dimension's `columns` accepts next \u2014 columns already used by an existing dimension are not listed again until the dimension using them is removed.\n\n`isCube: true` means this assembly is bound to a cube/OLAP source: its drill dimensions come from the cube itself, and add_hierarchy_dimension does not apply.\n\nThis is a **custom/irregular hierarchy** \u2014 an arbitrary drill path across columns that are not already nested on a shelf in that order. An ordinary sequential drill (binding dimensions to the same shelf via set_chart_shelf, outermost first) already works and does not need this tool at all.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The chart or crosstab's name." }
+      },
+      required: ["assembly"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly(args, "list_hierarchy_dimensions", "chart or crosstab");
+      const token = await requireSession(deps);
+      const query = new URLSearchParams({ assembly });
+      return deps.wizClient.get(path3(token, `hierarchy/dimensions?${query.toString()}`));
+    }
+  };
+}
+function makeAddHierarchyDimensionTool(deps) {
+  return {
+    name: "add_hierarchy_dimension",
+    description: 'Add a custom drill hierarchy dimension to a chart or crosstab: one level per column, in the order given (outermost first).\n\n  {assembly: "Sales", columns: ["Country", "State", "City"]}\n  {assembly: "Sales", columns: ["Order Date"], dateLevels: ["quarter"]}\n\n**This is for a custom/irregular hierarchy** \u2014 levels across columns that are not already nested on a shelf in that order. An ordinary sequential drill (binding dimensions to the same shelf via set_chart_shelf, outermost first) already works and does not need this tool.\n\nColumn names come from list_hierarchy_dimensions\' `availableColumns` \u2014 a column already used by another dimension on this assembly is refused (remove that dimension first, or pick a different column). The same column cannot appear twice within one call either.\n\n`dateLevels`, if given, is positional with `columns`: one entry per column (year | quarter | month | week | day | hour | minute | second), or a blank entry / a shorter array for "no date grouping" at that level. Only meaningful for a date-typed column; not validated against the column\'s own type, so a level on a non-date column is accepted and simply has no visible effect.\n\nOne call is one undo checkpoint. Verify with get_viewsheet_image.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The chart or crosstab's name." },
+        columns: {
+          type: "array",
+          items: { type: "string" },
+          description: `Column names for each level, outermost first, e.g. ["Country", "State", "City"]. From list_hierarchy_dimensions' availableColumns.`
+        },
+        dateLevels: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional, positional with 'columns': year | quarter | month | week | day | hour | minute | second, or blank for no date grouping at that level. May be shorter than 'columns'."
+        }
+      },
+      required: ["assembly", "columns"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly(args, "add_hierarchy_dimension", "chart or crosstab");
+      const columns = requireColumns(args.columns);
+      const dateLevels = normalizeDateLevels(args.dateLevels, columns.length);
+      const token = await requireSession(deps);
+      const result = await deps.wizClient.post(path3(token, "hierarchy/dimensions"), {
+        assembly,
+        columns,
+        dateLevels
+      });
+      return {
+        ok: true,
+        summary: `Added a hierarchy dimension on ${assembly}: ${columns.join(" > ")}. Verify with get_viewsheet_image.`,
+        dimension: result
+      };
+    }
+  };
+}
+function makeRemoveHierarchyDimensionTool(deps) {
+  return {
+    name: "remove_hierarchy_dimension",
+    description: "Remove a custom drill hierarchy dimension from a chart or crosstab by the `index` list_hierarchy_dimensions reports. Its columns become available to a new dimension again.\n\n**Indexes renumber after every removal**, so remove one at a time and re-list if removing several.\n\nOne call is one undo checkpoint.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The chart or crosstab's name." },
+        index: {
+          type: "number",
+          description: "The dimension index list_hierarchy_dimensions reports."
+        }
+      },
+      required: ["assembly", "index"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly(args, "remove_hierarchy_dimension", "chart or crosstab");
+      const index = requireIndex(args.index);
+      const token = await requireSession(deps);
+      const result = await deps.wizClient.post(path3(token, "hierarchy/dimensions/delete"), {
+        assembly,
+        index
+      });
+      return {
+        ok: true,
+        summary: `Removed hierarchy dimension ${index} from ${assembly}.`,
+        result
+      };
+    }
+  };
+}
+function makeHierarchyDimensionTools(deps) {
+  return [
+    makeListHierarchyDimensionsTool(deps),
+    makeAddHierarchyDimensionTool(deps),
+    makeRemoveHierarchyDimensionTool(deps)
+  ];
 }
 
 // src/tools/sheetPropertyTools.ts
@@ -26641,7 +27651,7 @@ function makeListDateRangesTool(deps) {
 function makeSetConditionTool(deps) {
   return {
     name: "set_condition",
-    description: 'Operates on a viewsheet assembly only (a chart/table/crosstab/selection on the viewsheet canvas) -- never a worksheet table. For a worksheet table\'s conditions use add_filter (single clause) or set_conditions/set_post_conditions/set_ranking/set_rankings (multiple/nested, post-aggregate, or top/bottom-N) instead -- their shapes differ from this tool\'s; see each tool\'s own description.\n\nReplace the conditions filtering an assembly.\n\n```\nconditions: [\n  {field: "Region",  operator: "one_of", values: ["East","West"], junction: "and"},\n  {field: "Revenue", operator: ">",      values: [10000]}\n]\n```\n\n**Each condition carries the junction to the NEXT one**, so the last one must not have a junction and every earlier one must. StyleBI stores these as an array alternating conditions and junctions; that array is built for you and cannot be written directly, because getting the alternation wrong produces a filter that either crashes or quietly means something else.\n\nEvery `field` must appear in get_condition\'s `fields` list. Operators accept aliases: `=`, `in`, `startsWith`, `!=` all resolve.\n\n**top_n/bottom_n** take one value shaped `{n, groupField}` instead of a plain scalar, e.g. `values: [{n: 5, groupField: "Region"}]` for the top 5 rows within each Region.\n\n**A value can be more than a literal.** In place of a plain scalar, any value may instead be an object `{type: "field"|"variable"|"session_data"|"expression", ...}` to compare against another column, a prompted variable, a built-in session value, or a computed expression:\n```\n{type: "field", field: "Budget"}                                 // compare to another column\n{type: "variable", name: "minRevenue", choiceQuery?: "..."}      // compare to a prompted variable\n{type: "session_data", name: "_USER_"}                           // _USER_ | _ROLES_ | _GROUPS_\n{type: "expression", expression: "parameter.minRevenue * 1.1", language?: "js"|"sql"}\n```\nA plain scalar/array of scalars is unaffected and still means a literal value. **An `expression` value is computed once to a single scalar**, not per-row like a calc field -- it has `parameter.<name>` in scope (the same store `variable`-type values read from) but **no `field` accessor**; `field[\'Col\']`/`field.Col` syntax belongs to calc fields and will throw if used here.\n\n**`equal`** (less_than/greater_than only) turns the operator into its "or equal to" form; it\'s round-tripped by get_condition.\n\n**AND binds tighter than OR** across a flat, same-level clause list -- `A or B and C` means `A or (B and C)`, not `(A or B) and C` and not plain left-to-right evaluation. **There is currently no reliable, documented way to override this precedence via `level`** -- the field exists and is round-tripped by get_condition (replaying its output back through set_condition preserves whatever nesting it already reports), but raising the level on a group of clauses to force `(A or B) and C` can crash the assembly\'s rendering outright rather than reshaping the grouping. If you need `(A or B) and C` rather than `A or (B and C)`, restructure the request -- e.g. issue it as two composed set_condition calls, or accept standard precedence and phrase the condition to match it.\n\n**A condition changes what renders.** One that matches nothing gives you an empty but structurally valid assembly and a clean return \u2014 so browse_condition_values first, and check get_viewsheet_image after. One call is one undo checkpoint.',
+    description: 'Operates on a viewsheet assembly only (a chart/table/crosstab/selection on the viewsheet canvas) -- never a worksheet table. For a worksheet table\'s conditions use add_filter (single clause) or set_conditions/set_post_conditions/set_ranking/set_rankings (multiple/nested, post-aggregate, or top/bottom-N) instead -- their shapes differ from this tool\'s; see each tool\'s own description.\n\nReplace the conditions filtering an assembly.\n\n```\nconditions: [\n  {field: "Region",  operator: "one_of", values: ["East","West"], junction: "and"},\n  {field: "Revenue", operator: ">",      values: [10000]}\n]\n```\n\n**Each condition carries the junction to the NEXT one**, so the last one must not have a junction and every earlier one must. StyleBI stores these as an array alternating conditions and junctions; that array is built for you and cannot be written directly, because getting the alternation wrong produces a filter that either crashes or quietly means something else.\n\nEvery `field` must appear in get_condition\'s `fields` list. Operators accept aliases: `=`, `in`, `startsWith`, `!=` all resolve.\n\n**top_n/bottom_n** take one value shaped `{n, groupField}` instead of a plain scalar, e.g. `values: [{n: 5, groupField: "Region"}]` for the top 5 rows within each Region.\n\n**A value can be more than a literal.** In place of a plain scalar, any value may instead be an object `{type: "field"|"variable"|"session_data"|"expression", ...}` to compare against another column, a prompted variable, a built-in session value, or a computed expression:\n```\n{type: "field", field: "Budget"}                                 // compare to another column\n{type: "variable", name: "minRevenue", choiceQuery?: "..."}      // compare to a prompted variable\n{type: "session_data", name: "_USER_"}                           // _USER_ | _ROLES_ | _GROUPS_\n{type: "expression", expression: "parameter.minRevenue * 1.1", language?: "js"|"sql"}\n```\nA plain scalar/array of scalars is unaffected and still means a literal value. **An `expression` value is computed once to a single scalar**, not per-row like a calc field -- it has `parameter.<name>` in scope (the same store `variable`-type values read from) but **no `field` accessor**; `field[\'Col\']`/`field.Col` syntax belongs to calc fields and will throw if used here.\n\n**`name`/`<name>` is not limited to a worksheet-created prompted variable (add_variable).** This same parameter store also holds every input assembly\'s own live value under its own assembly name -- `{type: "variable", name: "ComboBox1"}` and `parameter.ComboBox1 * 0.9` both read a ComboBox/Spinner/RadioButton/Slider/TextInput/CheckBox named `ComboBox1` directly, confirmed live, with no add_variable/set_variable_values step needed -- that path is for a Data Worksheet variable specifically, not a prerequisite for referencing a form component. See `references/dashboardscript/Parameter.md`.\n\n**`equal`** (less_than/greater_than only) turns the operator into its "or equal to" form; it\'s round-tripped by get_condition.\n\n**AND binds tighter than OR** across a flat, same-level clause list -- `A or B and C` means `A or (B and C)`, not `(A or B) and C` and not plain left-to-right evaluation. **There is currently no reliable, documented way to override this precedence via `level`** -- the field exists and is round-tripped by get_condition (replaying its output back through set_condition preserves whatever nesting it already reports), but raising the level on a group of clauses to force `(A or B) and C` can crash the assembly\'s rendering outright rather than reshaping the grouping. If you need `(A or B) and C` rather than `A or (B and C)`, restructure the request -- e.g. issue it as two composed set_condition calls, or accept standard precedence and phrase the condition to match it.\n\n**A condition changes what renders.** One that matches nothing gives you an empty but structurally valid assembly and a clean return \u2014 so browse_condition_values first, and check get_viewsheet_image after. One call is one undo checkpoint.',
     inputSchema: {
       type: "object",
       properties: {
@@ -26827,6 +27837,15 @@ async function requireColNameOnMeasuredChart(deps, token, assembly, args, tool) 
     `${tool} on '${assembly}' has no 'colName'/'row'/'col', and this chart has ${measures.length} measure(s) bound to x/y (${list}). A colName-less highlight on this chart type attaches to the whole chart, which the renderer never reads once any axis measure is bound \u2014 it would report ok:true and echo back correctly via list_highlights, but never actually render (stylebi bug 76522). Pass 'colName' naming the measure this highlight targets, exactly as get_binding reports it.`
   );
 }
+async function requireHighlightRenderableAssembly(deps, token, assembly, tool) {
+  const listing = await deps.wizClient.get(
+    path3(token, `properties/list?assembly=${encodeURIComponent(assembly)}`)
+  ).catch(() => void 0);
+  if ((listing?.assemblyType ?? "").trim().toLowerCase() !== "gauge") return;
+  throw new Error(
+    `${tool}: '${assembly}' is a Gauge -- StyleBI never applies a highlight's color to a gauge's needle/value, regardless of the condition (literal, variable, or expression) or which color channel (foreground/background) is used; it would report ok:true and echo back correctly via list_highlights, but never actually render. There is no set_highlight workaround for this assembly type -- use a Table/Crosstab/Chart cell instead (all three do support highlight), or the gauge's own range/color-band properties (rangeValues/rangeColorValues, via set_assembly_properties) for a similar visual effect.`
+  );
+}
 function extractHighlightFieldNames(fields) {
   if (!Array.isArray(fields)) return [];
   return fields.map((f) => typeof f === "string" ? f : f?.name).filter((f) => typeof f === "string" && f.trim() !== "");
@@ -26900,7 +27919,7 @@ function makeListHighlightsTool(deps) {
 function makeSetHighlightTool(deps) {
   return {
     name: "set_highlight",
-    description: 'Add or update a highlight \u2014 conditional formatting that colours rows or cells matching a condition.\n\n```\n{name: "HighRevenue", background: "#FFDDDD", applyRow: true,\n conditions: [{field: "Revenue", operator: ">", values: [10000]}]}\n```\n\n`conditions` uses **exactly the same vocabulary as set_condition** \u2014 each carries the junction to the NEXT one, and the last must not have one.\n\n`name` is required and is how the highlight is addressed later. **A name already in use is refused** rather than silently replacing that highlight; pass `replace: true` to update it deliberately. Call list_highlights first to see what is taken.\n\nAt least one of `foreground` or `background` is required: a highlight with neither is stored and renders nothing, which looks like a condition that never matched.\n\nOn a chart, `background` currently has no visible effect on the rendered mark colour \u2014 only `foreground` does. Use `foreground` for chart highlights.\n\nOn a chart, pass `axis: true` or `text: true` (with `colName` naming the axis/data-label field) to target that axis or data-label element instead of a mark cell.\n\nOne call is one undo checkpoint. Verify with get_viewsheet_image.',
+    description: 'Add or update a highlight \u2014 conditional formatting that colours rows or cells matching a condition.\n\n```\n{name: "HighRevenue", background: "#FFDDDD", applyRow: true,\n conditions: [{field: "Revenue", operator: ">", values: [10000]}]}\n```\n\n`conditions` uses **exactly the same vocabulary as set_condition** \u2014 each carries the junction to the NEXT one, and the last must not have one.\n\n`name` is required and is how the highlight is addressed later. **A name already in use is refused** rather than silently replacing that highlight; pass `replace: true` to update it deliberately. Call list_highlights first to see what is taken.\n\nAt least one of `foreground` or `background` is required: a highlight with neither is stored and renders nothing, which looks like a condition that never matched.\n\nOn a chart, `background` currently has no visible effect on the rendered mark colour \u2014 only `foreground` does. Use `foreground` for chart highlights.\n\nOn a chart, pass `axis: true` or `text: true` (with `colName` naming the axis/data-label field) to target that axis or data-label element instead of a mark cell.\n\n**Gauge does not support highlight at all** \u2014 refused up front rather than stored inert; use a Table/Crosstab/Chart cell instead, or the gauge\'s own rangeValues/rangeColorValues properties for a similar effect.\n\nOne call is one undo checkpoint. Verify with get_viewsheet_image.',
     inputSchema: {
       type: "object",
       properties: {
@@ -26991,6 +28010,7 @@ function makeSetHighlightTool(deps) {
         args,
         "set_highlight"
       );
+      await requireHighlightRenderableAssembly(deps, token, assembly, "set_highlight");
       await deps.wizClient.post(path3(token, "highlights"), {
         ...args,
         assembly,
@@ -27128,6 +28148,8 @@ Three separate, combinable ways to pass parameters to the target \u2014 pick by 
 
 'link.paramList' replaces the entire existing parameter list \u2014 pass every entry that should survive, not just the ones changing. A 'field' value naming a column the assembly can't actually bind (see list_bindable_fields) is refused, not silently dropped; its 'name' must match the TARGET's own variable name exactly, case-sensitive \u2014 a mismatch sends the parameter under a name nothing there reads, with no error.
 
+'link.webLink' is not always a plain URL. Two prefixed shapes are real, render/click-time behavior, not cosmetic: 'hyperlink:<field>' substitutes that field's own value at the point clicked (refused at write time if the field isn't one this assembly's data actually returns), and '=<expr>' is a script expression evaluated at view refresh (also checked synchronously at write time, so a broken expression is refused here instead of only failing later, silently, at the next render).
+
 One call is one undo checkpoint.`,
     inputSchema: {
       type: "object",
@@ -27150,7 +28172,10 @@ One call is one undo checkpoint.`,
           type: "object",
           properties: {
             linkType: { type: "string", description: LINK_TYPES.join(" | ") },
-            webLink: { type: "string", description: "For web and message links." },
+            webLink: {
+              type: "string",
+              description: "For web and message links. A plain string is a literal URL/message. Two other value shapes are also live at render/click time, not just Angular dialog sugar: 'hyperlink:<field>' substitutes the named field's value AT THE POINT THAT WAS CLICKED (the field must be a column the assembly's data actually returns, checked at write time); '=<expr>' is a script expression run at view refresh (checked synchronously at write time too, so a broken expression is refused here rather than only failing silently later)."
+            },
             assetLinkPath: { type: "string", description: "For viewsheet links." },
             assetLinkId: {
               type: "string",
@@ -27462,18 +28487,30 @@ Call this before set_chart_region_properties rather than guessing a name.`,
     }
   };
 }
+var AXIS_LOG_INERT_KEYS = /* @__PURE__ */ new Set(["minimum", "maximum", "increment", "minorincrement"]);
+var LOG_SCALE_KEY = "logarithmicscale";
+var DYNAMIC_REGION_TITLE_REGIONS = /* @__PURE__ */ new Set(["title", "legend"]);
+async function resolveChartRegionTitleDynamicRef(deps, token, region2, properties) {
+  const normalizedRegion = typeof region2 === "string" ? region2.trim().toLowerCase() : "";
+  if (!DYNAMIC_REGION_TITLE_REGIONS.has(normalizedRegion)) return;
+  const value = properties.title;
+  if (typeof value !== "string") return;
+  const name = extractComponentReference(value, "'properties.title'");
+  if (name === null) return;
+  const model = await deps.wizClient.get(path3(token, "model"));
+  requireResolvableComponentReference(name, "'properties.title'", model?.assemblies ?? []);
+}
+function isTruthy2(value) {
+  if (value === true) return true;
+  return typeof value === "string" && value.trim().toLowerCase() === "true";
+}
+function findPropertyKey(properties, keys) {
+  return Object.keys(properties).find((key) => keys.has(key.trim().toLowerCase()));
+}
 function makeSetChartRegionPropertiesTool(deps) {
   return {
     name: "set_chart_region_properties",
-    description: `Set properties on a chart's axis, legend or title.
-
-  {region: "axis",   target: "y", properties: {logarithmicScale: true}}
-  {region: "legend", target: "0", properties: {position: "right"}}
-  {region: "title",  target: "y", properties: {title: "Revenue"}}
-
-The patch is validated whole before any of it is applied, so a typo in one key does not leave the others written. An unknown key is refused with the names that do exist.
-
-One call is one undo checkpoint. Verify with get_viewsheet_image \u2014 an axis property that does not apply to the current chart type changes nothing visible.`,
+    description: 'Set properties on a chart\'s axis, legend or title.\n\n  {region: "axis",   target: "y", properties: {logarithmicScale: true}}\n  {region: "legend", target: "0", properties: {position: "right"}}\n  {region: "title",  target: "y", properties: {title: "Revenue"}}\n\nThe patch is validated whole before any of it is applied, so a typo in one key does not leave the others written. An unknown key is refused with the names that do exist.\n\n**Setting `minimum`/`maximum`/`increment`/`minorIncrement` on an axis that has (or this same call gives) `logarithmicScale: true` still writes and persists the values, but a `warning` comes back**: `increment` is always ignored by a log axis\'s own tick placement, `minorIncrement` only usefully subdivides within one decade, and a `minimum` at or below 1 clamps to the log floor. Nothing is refused \u2014 the values become live automatically if logarithmicScale is later set to false.\n\n**On region `"title"` or `"legend"`, `properties.title` may also be `"$(ComponentName)"`** \u2014 binds the title text to a CheckBox/ComboBox/RadioButton/Slider/Spinner/TextInput assembly\'s live value instead of a fixed literal. `ComponentName` must name an existing assembly of one of those types \u2014 a typo or a reference to a non-input assembly is refused, not silently saved. A CheckBox is refused too, since its value is always a list and a title text field takes one string. Not currently offered for `position`, axis range keys, or any color property \u2014 StyleBI does not resolve a dynamic reference for those, so a `"$(...)"`-shaped value there is stored and forwarded as a literal string, unchanged.\n\nOne call is one undo checkpoint. Verify with get_viewsheet_image \u2014 an axis property that does not apply to the current chart type changes nothing visible.',
     inputSchema: {
       type: "object",
       properties: {
@@ -27494,7 +28531,9 @@ One call is one undo checkpoint. Verify with get_viewsheet_image \u2014 an axis 
           "set_chart_region_properties requires 'properties' with at least one key. list_chart_region_properties reports the names this region accepts."
         );
       }
+      const properties = args.properties;
       const token = await requireSession(deps);
+      await resolveChartRegionTitleDynamicRef(deps, token, args.region, properties);
       await deps.wizClient.post(path3(token, "chart/region-properties"), {
         assembly: args.assembly,
         region: args.region,
@@ -27502,10 +28541,26 @@ One call is one undo checkpoint. Verify with get_viewsheet_image \u2014 an axis 
         field: args.field,
         properties: args.properties
       });
+      let warning;
+      if (args.region === "axis" && findPropertyKey(properties, AXIS_LOG_INERT_KEYS) !== void 0) {
+        const logScaleKey = findPropertyKey(properties, /* @__PURE__ */ new Set([LOG_SCALE_KEY]));
+        const logNow = logScaleKey !== void 0 ? isTruthy2(properties[logScaleKey]) : isTruthy2((await deps.wizClient.get(
+          path3(token, `chart/region-properties?${new URLSearchParams({
+            assembly: String(args.assembly ?? ""),
+            region: "axis",
+            target: String(args.target ?? ""),
+            ...args.field ? { field: args.field } : {}
+          }).toString()}`)
+        ))?.properties?.find((p) => p.name === "logarithmicScale")?.value);
+        if (logNow) {
+          warning = "minimum/maximum/increment/minorIncrement have limited or no effect while logarithmicScale is true on this axis: 'increment' is always ignored (a log axis places ticks at fixed decades, not a linear step), and 'minorIncrement' only meaningfully subdivides a single decade -- a value sized for a linear axis usually yields no visible minor ticks. 'minimum'/'maximum' are honored, but a minimum at or below 1 clamps to the log floor. Set logarithmicScale:false, in this same call or a prior one, for these to behave as on a linear axis.";
+        }
+      }
       const count = Object.keys(args.properties).length;
       return {
         ok: true,
-        summary: `Set ${count} propert${count === 1 ? "y" : "ies"} on ${args.assembly}'s ${args.region} '${args.target}'. Verify with get_viewsheet_image.`
+        summary: `Set ${count} propert${count === 1 ? "y" : "ies"} on ${args.assembly}'s ${args.region} '${args.target}'. Verify with get_viewsheet_image.` + (warning ? ` ${warning}` : ""),
+        ...warning ? { warning } : {}
       };
     }
   };
@@ -28073,7 +29128,7 @@ function makeListAestheticOptionsTool(deps) {
 function makeSetAestheticFieldTool(deps) {
   return {
     name: "set_aesthetic_field",
-    description: "Bind a field to one of a chart's aesthetic channels: " + FIELD_CHANNELS.join(", ") + ", plus " + NODE_CHANNELS.join(" and ") + " on relation charts (network, tree, chord) only \u2014 the backend refuses them by name on anything else.\n\nThe field is {column, type, aggregate?, dateLevel?, calculateInfo?} \u2014 the same vocabulary as set_chart_shelf, and 'type' is mandatory here too.\n\nBinding a dimension to colour is how you colour a chart by category. Binding a dimension to 'text' on a point chart with no size/shape/x/y-measure fields renders as a word cloud automatically \u2014 there is no separate word-cloud tool or flag, this shelf binding is the only control surface." + ONE_SOURCE_NOTE + DYNAMIC_COLUMN_REFERENCE_NOTE + "\n\n**Refused once a chart's multi-style is already on** (see set_chart_type's 'multi' parameter), on a StyleBI build that carries the `requireNotMultiAesthetic` guard (StyleBI commit 7adb11ccc). Against an older StyleBI without that guard, this call is not refused and can corrupt the chart's runtime rendering instead \u2014 still fail-loud on a patched build, just not on every build. Bind aesthetics before turning multi-style on regardless; that order redistributes them into each measure correctly, this order does not.\n\nOne call is one undo checkpoint. Look at the result with get_viewsheet_image \u2014 a clean return means the write was accepted, not that the chart looks right.",
+    description: "Bind a field to one of a chart's aesthetic channels: " + FIELD_CHANNELS.join(", ") + ", plus " + NODE_CHANNELS.join(" and ") + " on relation charts (network, tree, chord) only \u2014 the backend refuses them by name on anything else.\n\nThe field is {column, type, aggregate?, dateLevel?, calculateInfo?} \u2014 the same vocabulary as set_chart_shelf, and 'type' is mandatory here too.\n\nBinding a dimension to colour is how you colour a chart by category. Binding a dimension to 'text' on a point chart with no size/shape/x/y-measure fields renders as a word cloud automatically \u2014 there is no separate word-cloud tool or flag, this shelf binding is the only control surface." + ONE_SOURCE_NOTE + DYNAMIC_COLUMN_REFERENCE_NOTE + DYNAMIC_AGGREGATE_DATE_LEVEL_REFERENCE_NOTE + "\n\n**Refused once a chart's multi-style is already on** (see set_chart_type's 'multi' parameter), on a StyleBI build that carries the `requireNotMultiAesthetic` guard (StyleBI commit 7adb11ccc). Against an older StyleBI without that guard, this call is not refused and can corrupt the chart's runtime rendering instead \u2014 still fail-loud on a patched build, just not on every build. Bind aesthetics before turning multi-style on regardless; that order redistributes them into each measure correctly, this order does not.\n\nOne call is one undo checkpoint. Look at the result with get_viewsheet_image \u2014 a clean return means the write was accepted, not that the chart looks right.",
     inputSchema: {
       type: "object",
       properties: {
@@ -28113,10 +29168,21 @@ function makeSetAestheticFieldTool(deps) {
         );
       }
       const dynamicColumnRefs = /* @__PURE__ */ new Set();
-      const [field] = validateFields([args.field], { dynamicColumnRefs });
+      const dynamicAggregateRefs = /* @__PURE__ */ new Set();
+      const dynamicDateLevelRefs = /* @__PURE__ */ new Set();
+      const [field] = validateFields([args.field], {
+        dynamicColumnRefs,
+        dynamicAggregateRefs,
+        dynamicDateLevelRefs
+      });
       const table = normalizeTable(args.table, "set_aesthetic_field");
       const token = await requireSession2(deps);
-      await resolveDynamicColumnRefs(deps, token, dynamicColumnRefs, "set_aesthetic_field");
+      await resolveDynamicColumnRefs(
+        deps,
+        token,
+        { columns: dynamicColumnRefs, aggregates: dynamicAggregateRefs, dateLevels: dynamicDateLevelRefs },
+        "set_aesthetic_field"
+      );
       await refuseDateTypedDimensionWithoutLevel(deps, token, assembly, table, [field]);
       await deps.wizClient.post(
         path4(token, "chart/aesthetic-field"),
@@ -28722,6 +29788,9 @@ function requireAssembly7(args, tool) {
   }
   return args.assembly;
 }
+function preserveGroupField(currentValue) {
+  return typeof currentValue === "string" ? currentValue : void 0;
+}
 function requireCell(args, tool) {
   if (!Number.isInteger(args.row) || !Number.isInteger(args.col)) {
     throw new Error(
@@ -29035,13 +30104,13 @@ To confirm the change took effect, use get_calc_cell_script or get_viewsheet_ima
         grouping: currentBinding.grouping,
         expand: currentBinding.expand,
         mergeCells: currentBinding.mergeCells,
-        rowGroup: currentBinding.rowGroup,
-        colGroup: currentBinding.colGroup,
+        rowGroup: preserveGroupField(currentBinding.rowGroup),
+        colGroup: preserveGroupField(currentBinding.colGroup),
         name: currentBinding.name,
         sort: currentBinding.sort,
         topn: currentBinding.topn,
-        mergeRowGroup: currentBinding.mergeRowGroup,
-        mergeColGroup: currentBinding.mergeColGroup,
+        mergeRowGroup: preserveGroupField(currentBinding.mergeRowGroup),
+        mergeColGroup: preserveGroupField(currentBinding.mergeColGroup),
         timeSeries: currentBinding.timeSeries
       };
       await deps.wizClient.post(path4(token, "calc/cell"), { assembly, row, col, binding });
@@ -29088,7 +30157,7 @@ function makeSetCalcCellFormatTool(deps) {
         col: { type: "number", description: "0-based column." },
         format: {
           type: "object",
-          description: "Identical shape to set_format's 'format': CSS-shaped color, backgroundColor, font, align, format/formatSpec, borderTopStyle/Color/Width and the other three sides, roundCorner, wrapText. Required unless 'reset' is true."
+          description: `Identical shape to set_format's 'format': CSS-shaped color, backgroundColor, font, align, format/formatSpec, borderTopStyle/Color/Width and the other three sides, roundCorner, wrapText. Required unless 'reset' is true. As with set_format, a non-empty 'formatSpec' is rejected for both 'CurrencyFormat' and 'PercentFormat' -- neither takes a customizable pattern; use 'DecimalFormat' instead (e.g. formatSpec: "0.00%" for percent-like display with controlled decimal places).`
         },
         reset: {
           type: "boolean",
@@ -29106,6 +30175,7 @@ function makeSetCalcCellFormatTool(deps) {
       }
       const format = args.format === void 0 ? null : normalizeFormat(args.format) ?? null;
       const token = await requireSession2(deps);
+      await resolveFormatDynamicRefs(deps, token, format);
       await deps.wizClient.post(
         path4(token, "calc/cell/format"),
         { assembly, row, col, format, reset }
@@ -29189,7 +30259,7 @@ function makeSetCellBindingTool(deps) {
 
 These keys deliberately avoid 'type', 'btype' and 'role', each of which means something else elsewhere in this plugin; passing one fails rather than being guessed at.
 
-**A dimension field also takes 'dateLevel', 'dateInterval' and 'namedGroup'.** 'dateLevel' sets the grouping granularity of a date column (list_cell_vocabulary's 'dateLevels' lists the accepted names); 'dateInterval' groups every N of that unit (e.g. every 2 months) and only means something alongside 'dateLevel'. 'namedGroup' names a predefined named group to group the column's values by. Unlike a chart or crosstab, a calc-table cell does support a named group -- list_named_groups reports what a column offers, and an unrecognised name is refused rather than ignored. 'namedGroup' and 'sort' are independent and freely combine on the same call -- a named group only changes which raw values collapse into which labelled bucket; 'sort' (any direction, including manual) then orders the resulting labels same as it would any other value.
+**A dimension field also takes 'dateLevel', 'dateInterval' and 'namedGroup'.** 'dateLevel' sets the grouping granularity of a date column (list_cell_vocabulary's 'dateLevels' lists the accepted names); 'dateInterval' groups every N of that unit (e.g. every 2 months) and only means something alongside 'dateLevel'. 'dateInterval' above 1 and 'timeSeries: true' are mutually exclusive on the same cell -- StyleBI forces the effective interval to 1 whenever timeSeries is on, silently discarding a larger dateInterval, so the combination is refused rather than silently honoring only one of them. 'namedGroup' names a predefined named group to group the column's values by. Unlike a chart or crosstab, a calc-table cell does support a named group -- list_named_groups reports what a column offers, and an unrecognised name is refused rather than ignored. 'namedGroup' and 'sort' are independent and freely combine on the same call -- a named group only changes which raw values collapse into which labelled bucket; 'sort' (any direction, including manual) then orders the resulting labels same as it would any other value.
 
 **'dateLevel'/'dateInterval' are not preserved from the current binding.** Every other 'field' property must be restated on every write that touches this cell (the same way 'field.column' always must be) \u2014 omitting 'dateLevel' does not mean 'leave the current level', it means 'no level'.
 
@@ -29361,15 +30431,22 @@ grouping, expand, mergeCells, rowGroup, colGroup, name, sort, topn, mergeRowGrou
         grouping: requested.grouping ?? currentBinding.grouping,
         expand: requested.expand ?? currentBinding.expand,
         mergeCells: requested.mergeCells ?? currentBinding.mergeCells,
-        rowGroup: "rowGroup" in requested ? requested.rowGroup : currentBinding.rowGroup,
-        colGroup: "colGroup" in requested ? requested.colGroup : currentBinding.colGroup,
+        rowGroup: "rowGroup" in requested ? requested.rowGroup : preserveGroupField(currentBinding.rowGroup),
+        colGroup: "colGroup" in requested ? requested.colGroup : preserveGroupField(currentBinding.colGroup),
         name: requested.name ?? currentBinding.name,
         sort: requested.sort ?? currentBinding.sort,
         topn: requested.topn ?? currentBinding.topn,
-        mergeRowGroup: "mergeRowGroup" in requested ? requested.mergeRowGroup : currentBinding.mergeRowGroup,
-        mergeColGroup: "mergeColGroup" in requested ? requested.mergeColGroup : currentBinding.mergeColGroup,
+        mergeRowGroup: "mergeRowGroup" in requested ? requested.mergeRowGroup : preserveGroupField(currentBinding.mergeRowGroup),
+        mergeColGroup: "mergeColGroup" in requested ? requested.mergeColGroup : preserveGroupField(currentBinding.mergeColGroup),
         timeSeries: requested.timeSeries ?? currentBinding.timeSeries
       };
+      const normalizedContent = typeof binding.content === "string" ? binding.content.trim().toLowerCase() : "";
+      const boundField = normalizedContent === "column" ? binding.field : void 0;
+      if (binding.timeSeries === true && typeof boundField?.dateInterval === "number" && boundField.dateInterval > 1) {
+        throw new Error(
+          `set_cell_binding: 'timeSeries: true' and 'field.dateInterval: ${boundField.dateInterval}' cannot be combined on this cell -- StyleBI forces the effective interval to 1 whenever 'timeSeries' is on (the requested dateInterval is read, then explicitly discarded), so the table would silently render at per-unit granularity instead of every ${boundField.dateInterval} units. Set 'timeSeries: false' to use 'dateInterval: ${boundField.dateInterval}', or omit 'dateInterval' (or leave it at 1) to keep 'timeSeries: true'.`
+        );
+      }
       for (const key of ["rowGroup", "colGroup"]) {
         const value = key in requested ? requested[key] : void 0;
         if (typeof value === "string" && value !== "(default)") {
@@ -29607,7 +30684,7 @@ function makeGetTableBindingTool(deps) {
 function makeSetTableFieldsTool(deps) {
   return {
     name: "set_table_fields",
-    description: "Replace every field on one shelf of a crosstab or table.\n\nCrosstab shelves: " + CROSSTAB_SHELVES.join(", ") + ". Table shelves: " + TABLE_SHELVES.join(", ") + ".\n\nEach field is {column, type, aggregate?, dateLevel?, calculateInfo?}. Dimension shelves take dimensions and the aggregates shelf takes measures \u2014 putting one on the other is refused rather than coerced, because it renders a real-looking table of the wrong shape. calculateInfo \u2014 a per-measure Trend/Calculator, on the aggregates shelf only. " + CALCULATE_INFO_DESCRIPTION + "\n\n'fields' is always required: pass an explicit empty array to clear a shelf. To move a field between shelves use move_table_field, not two calls \u2014 it is one undo checkpoint rather than two.\n\nOn an assembly with no source yet, this establishes it the same way dropping a column in the Composer does \u2014 pass 'table', or omit it and the source is inferred when the columns name exactly one; an ambiguous or unknown name is refused rather than guessed." + DYNAMIC_COLUMN_REFERENCE_NOTE,
+    description: "Replace every field on one shelf of a crosstab or table.\n\nCrosstab shelves: " + CROSSTAB_SHELVES.join(", ") + ". Table shelves: " + TABLE_SHELVES.join(", ") + ".\n\nEach field is {column, type, aggregate?, dateLevel?, calculateInfo?, secondaryColumn?}. Dimension shelves take dimensions and the aggregates shelf takes measures \u2014 putting one on the other is refused rather than coerced, because it renders a real-looking table of the wrong shape. " + SECONDARY_COLUMN_DESCRIPTION + " calculateInfo \u2014 a per-measure Trend/Calculator, on the aggregates shelf only. " + CALCULATE_INFO_DESCRIPTION + "\n\n'fields' is always required: pass an explicit empty array to clear a shelf. To move a field between shelves use move_table_field, not two calls \u2014 it is one undo checkpoint rather than two.\n\nOn an assembly with no source yet, this establishes it the same way dropping a column in the Composer does \u2014 pass 'table', or omit it and the source is inferred when the columns name exactly one; an ambiguous or unknown name is refused rather than guessed." + DYNAMIC_COLUMN_REFERENCE_NOTE + DYNAMIC_AGGREGATE_DATE_LEVEL_REFERENCE_NOTE,
     inputSchema: {
       type: "object",
       properties: {
@@ -29624,6 +30701,7 @@ function makeSetTableFieldsTool(deps) {
               type: { type: "string", description: "dimension | measure" },
               aggregate: { type: "string", description: "Measures only." },
               dateLevel: { type: "string", description: DATE_LEVEL_DESCRIPTION },
+              secondaryColumn: { type: "string", description: SECONDARY_COLUMN_DESCRIPTION },
               calculateInfo: { type: "object", description: CALCULATE_INFO_DESCRIPTION },
               namedGroup: NAMED_GROUP_SCHEMA,
               namedGroupValues: NAMED_GROUP_VALUES_SCHEMA
@@ -29638,14 +30716,37 @@ function makeSetTableFieldsTool(deps) {
       const assembly = requireAssembly8(args, "set_table_fields");
       const shelf = normalizeShelf(args.shelf, "set_table_fields");
       const dynamicColumnRefs = /* @__PURE__ */ new Set();
-      const fields = validateFields(args.fields, { dynamicColumnRefs });
+      const dynamicAggregateRefs = /* @__PURE__ */ new Set();
+      const dynamicDateLevelRefs = /* @__PURE__ */ new Set();
+      const fields = validateFields(args.fields, {
+        dynamicColumnRefs,
+        dynamicAggregateRefs,
+        dynamicDateLevelRefs
+      });
       normalizeDetailsMeasures(shelf, fields);
       requireShelfAccepts(shelf, fields);
       const table = normalizeTable(args.table, "set_table_fields");
       const token = await requireSession2(deps);
-      await resolveDynamicColumnRefs(deps, token, dynamicColumnRefs, "set_table_fields");
+      await resolveDynamicColumnRefs(
+        deps,
+        token,
+        { columns: dynamicColumnRefs, aggregates: dynamicAggregateRefs, dateLevels: dynamicDateLevelRefs },
+        "set_table_fields"
+      );
       await refuseNonNumericAggregate(deps, token, assembly, table, fields);
-      await deps.wizClient.post(path4(token, "table/fields"), { assembly, shelf, fields, table });
+      await refuseDateTypedDimensionWithoutLevel(deps, token, assembly, table, fields);
+      try {
+        await deps.wizClient.post(path4(token, "table/fields"), { assembly, shelf, fields, table });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (PARTIAL_STATE_ON_ERROR_MARKER.test(message)) {
+          await undoBindingSession(deps, token);
+          throw new Error(
+            `set_table_fields was rejected and has been automatically reverted -- get_table_binding reflects the prior, unchanged state. StyleBI's original error: "${message}"`
+          );
+        }
+        throw err;
+      }
       return {
         ok: true,
         summary: `Set ${fields.length} field(s) on the ${shelf} shelf of ${assembly}` + (table ? `, from ${table}` : "") + `. Verify with get_viewsheet_image.`
@@ -29656,7 +30757,7 @@ function makeSetTableFieldsTool(deps) {
 function makeSetTableSourceTool(deps) {
   return {
     name: "set_table_source",
-    description: "Point a crosstab or table at the source table its fields come from. This repoints only this one assembly \u2014 it is independent of the viewsheet's base, and never requires attach_base_worksheet or changing the base.\n\nAn assembly added in the Composer starts with no source. Its shelves can be filled in and it will still render completely empty, because shelves with no source have nothing to query \u2014 so set the source before, or straight after, binding fields.\n\nCall list_bindable_fields for the names this assembly can bind to; an unknown one is refused rather than left to render an empty assembly.\n\nRepointing an assembly that already has fields bound discards them, since those columns belong to the old source. That is refused unless you pass force:true.\n\nOne call is one undo checkpoint. Verify with get_viewsheet_image.",
+    description: "Point a crosstab, table, or calc_table at the source table its fields come from. This repoints only this one assembly \u2014 it is independent of the viewsheet's base, and never requires attach_base_worksheet or changing the base.\n\nAn assembly added in the Composer starts with no source. Its shelves can be filled in and it will still render completely empty, because shelves with no source have nothing to query \u2014 so set the source before, or straight after, binding fields. For a calc_table this is the only way to give it a source: set_cell_binding has no 'table' parameter, so a freehand/calc table renders headers only, with no data rows, until this is called.\n\nCall list_bindable_fields for the names this assembly can bind to; an unknown one is refused rather than left to render an empty assembly.\n\nRepointing an assembly that already has fields bound discards them, since those columns belong to the old source. That is refused unless you pass force:true.\n\nOne call is one undo checkpoint. Verify with get_viewsheet_image.",
     inputSchema: {
       type: "object",
       properties: {
@@ -29737,6 +30838,7 @@ function makeAddTableFieldTool(deps) {
       const table = normalizeTable(args.table, "add_table_field");
       const token = await requireSession2(deps);
       await refuseNonNumericAggregate(deps, token, assembly, table, [field]);
+      await refuseDateTypedDimensionWithoutLevel(deps, token, assembly, table, [field]);
       await deps.wizClient.post(
         path4(token, "table/field/add"),
         { assembly, shelf, field, position: args.position, table }
@@ -29774,7 +30876,7 @@ function makeRemoveTableFieldTool(deps) {
 function makeMoveTableFieldTool(deps) {
   return {
     name: "move_table_field",
-    description: "Move a field from one shelf to another \u2014 the crosstab pivot.\n\nMoving a dimension from rows to cols is the most common table edit there is. Use this rather than remove-then-add: it is one undo checkpoint instead of two, and the user never sees the half-pivoted state in between.\n\nA move to an incompatible shelf is refused with the field left where it was.",
+    description: "Move a field from one shelf to another \u2014 the crosstab pivot.\n\nMoving a dimension from rows to cols is the most common table edit there is. Use this rather than remove-then-add: it is one undo checkpoint instead of two, and the user never sees the half-pivoted state in between.\n\nA move to an incompatible shelf is not blocked: the field is converted to match the destination shelf's kind instead, mirroring the Composer UI's own drag-and-drop pivot. A dimension moved onto aggregates becomes a measure (Sum for a numeric column, Count otherwise); a measure moved off aggregates becomes a plain dimension, its aggregate dropped. So an ok:true response does not mean the field kept its original kind \u2014 the response's summary says when a conversion happened; call get_table_binding afterward if you need the exact resulting type/aggregate.",
     inputSchema: {
       type: "object",
       properties: {
@@ -29810,9 +30912,51 @@ function makeMoveTableFieldTool(deps) {
           position: args.position
         }
       );
+      const converts = fromShelf === "aggregates" !== (toShelf === "aggregates");
+      const conversionNote = !converts ? "" : toShelf === "aggregates" ? ` ${column} was converted from a dimension to a measure (Sum for a numeric column, Count otherwise), since 'aggregates' only holds measures.` : ` ${column} was converted from a measure to a plain dimension, its aggregate dropped, since '${toShelf}' only holds dimensions.`;
       return {
         ok: true,
-        summary: `Moved ${column} from ${fromShelf} to ${toShelf} on ${assembly}. Verify with get_viewsheet_image.`
+        summary: `Moved ${column} from ${fromShelf} to ${toShelf} on ${assembly}.` + conversionNote + ` Verify with get_viewsheet_image.`,
+        ...converts && {
+          disclosure: disclosure(
+            assembly,
+            "meaning",
+            `${column} on ${assembly} changed kind (dimension <-> measure) as part of this move, so what its values mean has changed even though the shelf layout still looks like an ordinary pivot.`
+          )
+        }
+      };
+    }
+  };
+}
+function makeSetTableFieldVisibilityTool(deps) {
+  return {
+    name: "set_table_field_visibility",
+    description: "Hide or show one already-bound field's column on a Table's details shelf, without unbinding it -- StyleBI's own Hide Column dialog. The field stays bound (still resolvable by a condition, hyperlink, or another reference) and still reported by get_table_binding; it just does not render.\n\nDistinct from two other tools that sound similar: remove_table_field drops the binding entirely, so a hidden-but-removed field is no longer usable by anything. set_column_visibility (a worksheet tool) excludes a column from a WORKSHEET query's output \u2014 a completely different assembly kind from a viewsheet Table.\n\nTable only, for now -- a Crosstab's hide/show is keyed by rendered pivot occurrence, not by field name, so it is refused by name rather than silently no-op'd.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The table's name. Must be a Table, not a Crosstab." },
+        column: { type: "string", description: "The column to hide or show. Must already be bound." },
+        visible: { type: "boolean", description: "true shows the column, false hides it." }
+      },
+      required: ["assembly", "column", "visible"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly8(args, "set_table_field_visibility");
+      const column = requireColumn(args, "set_table_field_visibility");
+      if (typeof args.visible !== "boolean") {
+        throw new Error(
+          "set_table_field_visibility requires 'visible' as a boolean -- true shows the column, false hides it."
+        );
+      }
+      const token = await requireSession2(deps);
+      await deps.wizClient.post(
+        path4(token, "table/field/visibility"),
+        { assembly, column, visible: args.visible }
+      );
+      return {
+        ok: true,
+        summary: `${args.visible ? "Showed" : "Hid"} ${column} on ${assembly}. Verify with get_viewsheet_image.`
       };
     }
   };
@@ -29824,7 +30968,8 @@ function makeTableTools(deps) {
     makeSetTableSourceTool(deps),
     makeAddTableFieldTool(deps),
     makeRemoveTableFieldTool(deps),
-    makeMoveTableFieldTool(deps)
+    makeMoveTableFieldTool(deps),
+    makeSetTableFieldVisibilityTool(deps)
   ];
 }
 function normalizeDetailsMeasures(shelf, fields) {
@@ -30270,6 +31415,72 @@ function makeSetColumnLabelsTool(deps) {
     }
   };
 }
+function normalizeColumnWidthsMap(value, tool) {
+  const raw = value;
+  const normalized = {};
+  for (const [column, width] of Object.entries(raw)) {
+    if (width === null) {
+      normalized[column] = null;
+      continue;
+    }
+    let numericWidth = width;
+    if (typeof numericWidth === "string" && numericWidth.trim() !== "" && !Number.isNaN(Number(numericWidth))) {
+      numericWidth = Number(numericWidth);
+    }
+    if (typeof numericWidth !== "number" || !Number.isFinite(numericWidth) || numericWidth <= 0) {
+      throw new Error(
+        `${tool}: 'widths["${column}"]' must be a positive finite pixel width, or null to reset to auto-fit \u2014 got '${String(width)}'.`
+      );
+    }
+    normalized[column] = numericWidth;
+  }
+  return normalized;
+}
+function makeSetColumnWidthsTool(deps) {
+  return {
+    name: "set_column_widths",
+    description: `Set a crosstab's or table's column widths, in pixels.
+
+  {assembly: "C1", widths: {"Region": 150, "Sum(Sales)": null}}
+
+A numeric value is a pixel width. \`null\` resets that column back to auto-fit width.
+
+Column names match the assembly's currently **rendered** header text \u2014 the same addressing convention \`set_column_labels\` uses. An unknown or ambiguous name (bound more than once, e.g. a Year/Quarter drill on the same column) is refused by the server naming what's wrong, since resolving that needs the live render this tool doesn't have on its own.
+
+One call is one undo checkpoint.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The table or crosstab's name." },
+        widths: {
+          type: "object",
+          description: "Column name to pixel width (number), or null to reset to auto-fit."
+        }
+      },
+      required: ["assembly", "widths"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly9(args, "set_column_widths");
+      if (args.widths === null || typeof args.widths !== "object" || Array.isArray(args.widths) || Object.keys(args.widths).length === 0) {
+        throw new Error("set_column_widths requires a non-empty 'widths' object.");
+      }
+      const widths = normalizeColumnWidthsMap(
+        args.widths,
+        "set_column_widths"
+      );
+      const token = await requireSession2(deps);
+      const response = await deps.wizClient.post(
+        path4(token, "table/column-width"),
+        { assembly, widths }
+      );
+      const applied = Array.isArray(response?.applied) ? response.applied : [];
+      return {
+        ok: true,
+        summary: applied.length > 0 ? `Set column width on ${applied.length}: ${applied.join(", ")}.` : `No column width on ${assembly} changed \u2014 every requested column already matched, or the targeted column no longer resolves.`
+      };
+    }
+  };
+}
 function makeSetTableOptionsTool(deps) {
   return {
     name: "set_table_options",
@@ -30306,6 +31517,7 @@ function makeTableFormatTools(deps) {
     makeSetFieldSortTool(deps),
     makeSetFieldRankingTool(deps),
     makeSetColumnLabelsTool(deps),
+    makeSetColumnWidthsTool(deps),
     makeSetTableOptionsTool(deps)
   ];
 }
@@ -30714,7 +31926,7 @@ function makeListScriptLibraryTool(deps) {
 function makeCreateScriptLibraryFunctionTool(deps) {
   return {
     name: "create_script_library_function",
-    description: "Create a new Script Library function -- a reusable, named script asset independent of any worksheet/viewsheet, callable from any viewsheet's script by name. No connected sheet is required. Refuses if a function named `name` already exists -- use update_script_library_function to change an existing one instead of clobbering it.",
+    description: "Create a new Script Library function -- a reusable, named script asset independent of any worksheet/viewsheet, callable from any viewsheet's script by name. No connected sheet is required. Refuses if a function named `name` already exists -- use update_script_library_function to change an existing one instead of clobbering it. The response's `resyncWarning` flags that a viewsheet session already open before this call won't see the new function in execute_script/run_script_live until it resyncs (e.g. refresh_viewsheet).",
     inputSchema: {
       type: "object",
       properties: {
@@ -30746,7 +31958,7 @@ function makeReadScriptLibraryFunctionTool(deps) {
 function makeUpdateScriptLibraryFunctionTool(deps) {
   return {
     name: "update_script_library_function",
-    description: "Set a Script Library function's text (and optionally comment) by name. No connected sheet is required. Refuses if no function named `name` exists yet -- use create_script_library_function first. Omitting `comment` leaves the function's existing comment unchanged.",
+    description: "Set a Script Library function's text (and optionally comment) by name. No connected sheet is required. Refuses if no function named `name` exists yet -- use create_script_library_function first. Omitting `comment` leaves the function's existing comment unchanged. The response's `resyncWarning` flags that a viewsheet session already open before this call won't see the updated function body in execute_script/run_script_live until it resyncs (e.g. refresh_viewsheet) -- it will keep returning the old result.",
     inputSchema: {
       type: "object",
       properties: {
@@ -30762,10 +31974,28 @@ function makeUpdateScriptLibraryFunctionTool(deps) {
     })
   };
 }
+function makeRenameScriptLibraryFunctionTool(deps) {
+  return {
+    name: "rename_script_library_function",
+    description: "Rename a Script Library function -- moves it to a new name and rewrites every referencing viewsheet/worksheet script's call sites to the new name automatically (unlike doing this by hand with create_script_library_function(newName) followed by delete_script_library_function(oldName), which does NOT update callers and will break them). Refuses if oldName doesn't exist, or if a function named newName already exists (delete_script_library_function it first if you mean to replace it).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        oldName: { type: "string", description: "The function's current name." },
+        newName: { type: "string", description: "The function's new name." }
+      },
+      required: ["oldName", "newName"]
+    },
+    call: async (args) => deps.wizClient.post(
+      `${BASE_PATH}/${encodeURIComponent(args.oldName)}/rename`,
+      { newName: args.newName }
+    )
+  };
+}
 function makeDeleteScriptLibraryFunctionTool(deps) {
   return {
     name: "delete_script_library_function",
-    description: "Delete a Script Library function by name. No connected sheet is required. This is permanent -- there is no undo tool for the Script Library the way undo_worksheet/undo_viewsheet cover a sheet. Refused by default if another asset still references this function (the error names them) -- pass force:true to delete anyway.",
+    description: "Delete a Script Library function by name. No connected sheet is required. This is permanent -- there is no undo tool for the Script Library the way undo_worksheet/undo_viewsheet cover a sheet. Refused by default if another asset still references this function (the error names them) -- pass force:true to delete anyway. The response's `resyncWarning` flags that a viewsheet session already open before this call may keep calling the deleted function successfully (stale result) in execute_script/run_script_live until it resyncs (e.g. refresh_viewsheet).",
     inputSchema: {
       type: "object",
       properties: {
@@ -30779,8 +32009,10 @@ function makeDeleteScriptLibraryFunctionTool(deps) {
     },
     call: async (args) => {
       const query = args.force ? "?force=true" : "";
-      await deps.wizClient.delete(`${BASE_PATH}/${encodeURIComponent(args.name)}${query}`);
-      return { ok: true };
+      const result = await deps.wizClient.delete(
+        `${BASE_PATH}/${encodeURIComponent(args.name)}${query}`
+      );
+      return { ok: true, resyncWarning: result?.resyncWarning };
     }
   };
 }
@@ -30808,6 +32040,7 @@ function makeScriptLibraryTools(deps) {
     makeCreateScriptLibraryFunctionTool(deps),
     makeReadScriptLibraryFunctionTool(deps),
     makeUpdateScriptLibraryFunctionTool(deps),
+    makeRenameScriptLibraryFunctionTool(deps),
     makeDeleteScriptLibraryFunctionTool(deps),
     makeCheckScriptLibrarySyntaxTool(deps)
   ];
@@ -30935,7 +32168,7 @@ function normalizeSelectionValues(values) {
 function makeSetSelectionTool(deps) {
   return {
     name: "set_selection",
-    description: 'Set which values a selection list, selection tree or range slider has selected, and its sort order and single-vs-multi style.\n\n  {assembly: "Region", values: ["East","West"]}       selects two values\n  {assembly: "Geo", values: [["East","NY"]]}          a tree path\n  {assembly: "Region", sortOrder: "desc"}              sorts, selection untouched\n  {assembly: "Region", singleSelect: true}             one value at a time\n\n**This is a filter, and a filter is the change a viewer cannot see.** The dashboard renders normally and simply shows a subset, with nothing on screen saying a selection is applied. The state is written into the asset on save, so it becomes what every future viewer opens with. The response carries a `disclosure` for that reason.\n\n**`sortOrder` is reached by cycling.** The runtime has no setter \u2014 it advances asc \u2192 desc \u2192 specific \u2014 so this may take up to two steps. They happen inside one undo checkpoint, and the response reports `sortCycles`.\n\n**A search string on the assembly silently narrows what this applies to.** If one is set, the write lands only on the matching values, and the response reports `scopedBySearch`. Search cannot be set here: it is never restored when the sheet is reopened.\n\n**On a range slider, each value is one bound of the range (two values select an interval; one selects a single point).** A bound outside the slider\'s actual bucket range is not refused \u2014 it is clamped to the nearest bucket, and the response reports `clampedBounds` (each entry\'s `requested` vs. what was actually `applied`) so a caller can tell the applied filter differs from the literal request.\n\n**On a list or non-ID-mode tree, `values` replaces the current selection by default** \u2014 anything currently selected but not named in `values` is deselected. Pass `additive: true` to make `values` only ADD instead \u2014 nothing already selected is touched. To remove specific values without touching anything else (whichever mode `values`/`additive` is in, or with no `values` at all), name them in `deselect` \u2014 the response reports `deselected`. Naming the same value in both `values` and `deselect` in one call is refused as a contradiction. `deselect` only applies where the replace-diff itself applies (a list or non-ID-mode tree) \u2014 for anything else, clear_selection removes everything, or a fresh `values` call is the only way to change a range slider.\n\nTo remove a selection use clear_selection \u2014 it is **not** the same as selecting every value. Selecting everything writes a snapshot of today\'s values, which will exclude any value added to the data later; clearing writes no selection at all.',
+    description: 'Set which values a selection list, selection tree or range slider has selected, and its sort order and single-vs-multi style.\n\n  {assembly: "Region", values: ["East","West"]}       selects two values\n  {assembly: "Geo", values: [["East","NY"]]}          a tree path\n  {assembly: "Region", sortOrder: "desc"}              sorts, selection untouched\n  {assembly: "Region", singleSelect: true}             one value at a time\n  {assembly: "Region", search: "Sm", values: ["Smith"]}  sets the search box, then selects\n\n**This is a filter, and a filter is the change a viewer cannot see.** The dashboard renders normally and simply shows a subset, with nothing on screen saying a selection is applied. The state is written into the asset on save, so it becomes what every future viewer opens with. The response carries a `disclosure` for that reason.\n\n**`sortOrder` is reached by cycling.** The runtime has no setter \u2014 it advances asc \u2192 desc \u2192 specific \u2014 so this may take up to two steps. They happen inside one undo checkpoint, and the response reports `sortCycles`.\n\n**A search string on the assembly silently narrows what this applies to.** If one is set (via this call\'s own `search`, or already active from an earlier call), the write lands only on the matching values, and the response reports `scopedBySearch`. Pass `search` to set it before this call\'s write applies -- the same as a person typing into the widget\'s own search box first. Like the widget\'s own search box, it is never restored when the sheet is reopened.\n\n**On a range slider, each value is one bound of the range (two values select an interval; one selects a single point).** A bound outside the slider\'s actual bucket range is not refused \u2014 it is clamped to the nearest bucket, and the response reports `clampedBounds` (each entry\'s `requested` vs. what was actually `applied`) so a caller can tell the applied filter differs from the literal request.\n\n**On a list or non-ID-mode tree, `values` replaces the current selection by default** \u2014 anything currently selected but not named in `values` is deselected. Pass `additive: true` to make `values` only ADD instead \u2014 nothing already selected is touched. To remove specific values without touching anything else (whichever mode `values`/`additive` is in, or with no `values` at all), name them in `deselect` \u2014 the response reports `deselected`. Naming the same value in both `values` and `deselect` in one call is refused as a contradiction. `deselect` only applies where the replace-diff itself applies (a list or non-ID-mode tree) \u2014 for anything else, clear_selection removes everything, or a fresh `values` call is the only way to change a range slider.\n\nTo remove a selection use clear_selection \u2014 it is **not** the same as selecting every value. Selecting everything writes a snapshot of today\'s values, which will exclude any value added to the data later; clearing writes no selection at all.',
     inputSchema: {
       type: "object",
       properties: {
@@ -30962,15 +32195,19 @@ function makeSetSelectionTool(deps) {
         additive: {
           type: "boolean",
           description: "true to make 'values' only add to the current selection, skipping the default replace behavior (nothing currently selected gets deselected). No effect where the replace-diff never ran anyway (single-select, a range slider, an ID-mode tree, a calendar)."
+        },
+        search: {
+          type: "string",
+          description: "Sets the assembly's search box text before the rest of this call applies -- the same as a person typing into the search box first. Only valid on a selection list or tree; a range slider has no search box. Not restored on reopen, same as the widget's own search box."
         }
       },
       required: ["assembly"]
     },
     call: async (args) => {
       const assembly = requireAssembly10(args, "set_selection");
-      if (args.values === void 0 && args.sortOrder === void 0 && args.singleSelect === void 0 && args.deselect === void 0) {
+      if (args.values === void 0 && args.sortOrder === void 0 && args.singleSelect === void 0 && args.deselect === void 0 && args.search === void 0) {
         throw new Error(
-          "set_selection needs at least one of 'values', 'deselect', 'sortOrder' or 'singleSelect' \u2014 otherwise there is nothing to change."
+          "set_selection needs at least one of 'values', 'deselect', 'sortOrder', 'singleSelect' or 'search' \u2014 otherwise there is nothing to change."
         );
       }
       const values = args.values === void 0 ? void 0 : normalizeSelectionValues(args.values);
@@ -30987,9 +32224,13 @@ function makeSetSelectionTool(deps) {
         deselect: deselectValues,
         sortOrder: args.sortOrder,
         singleSelect: args.singleSelect,
-        additive: args.additive
+        additive: args.additive,
+        search: args.search
       });
       const parts = [];
+      if (result?.searchSet !== void 0) {
+        parts.push(`set search to "${result.searchSet}"`);
+      }
       if (result?.valuesSelected !== void 0) {
         parts.push(`selected ${result.valuesSelected} value(s)`);
       }
@@ -31008,6 +32249,7 @@ function makeSetSelectionTool(deps) {
         assembly,
         type: result?.type,
         ...result?.sortCycles !== void 0 ? { sortCycles: result.sortCycles } : {},
+        ...result?.searchSet !== void 0 ? { searchSet: result.searchSet } : {},
         ...result?.scopedBySearch !== void 0 ? { scopedBySearch: result.scopedBySearch } : {},
         ...result?.clampedBounds && result.clampedBounds.length > 0 ? { clampedBounds: result.clampedBounds } : {},
         ...result?.deselected !== void 0 ? { deselected: result.deselected } : {},
@@ -31069,7 +32311,7 @@ function makeClearSelectionTool(deps) {
 function makeSelectSubtreeTool(deps) {
   return {
     name: "select_subtree",
-    description: 'Select or clear a whole subtree of a **selection tree**, addressed by its path from the root.\n\n  {assembly: "Geo", path: ["East"], mode: "select"}          selects East and everything under it\n  {assembly: "Geo", path: ["East","NY"], mode: "clear"}     clears that branch\n\nOnly selection trees have subtrees \u2014 a list or range slider is refused, because the underlying endpoint fails with an internal error rather than saying so.\n\nLike any selection this persists on save and is invisible to the next viewer, so the response carries a disclosure.',
+    description: 'Select or clear a whole subtree of a **selection tree**, addressed by its path from the root.\n\n  {assembly: "Geo", path: ["East"], mode: "select"}          selects East and everything under it\n  {assembly: "Geo", path: ["East","NY"], mode: "clear"}     clears that branch\n\nOnly selection trees have subtrees \u2014 a list or range slider is refused, because the underlying endpoint fails with an internal error rather than saying so.\n\n**Refused on a `mode: "select"` call if the tree is single-select and `path` doesn\'t already reach a leaf** (i.e. it\'s shorter than the tree\'s own number of levels). Selecting a whole branch above the leaf level is ambiguous under single-select \u2014 call set_selection with `singleSelect: false` first to widen it, or name the full path down to a leaf instead. **Not checked on an ID-mode tree** \u2014 a path there is matched by value anywhere in the tree rather than positionally from the root, so an ID-mode single-select tree can still silently collapse a multi-descendant selection down to one leaf.\n\nLike any selection this persists on save and is invisible to the next viewer, so the response carries a disclosure.',
     inputSchema: {
       type: "object",
       properties: {
@@ -31123,6 +32365,19 @@ function makeSelectSubtreeTool(deps) {
     }
   };
 }
+function titleizeColumnWord(word) {
+  if (word.toLowerCase() === "id") {
+    return "ID";
+  }
+  return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+}
+function humanizeColumnLabel(column) {
+  const words = column.split(/[\s_]+/).filter((w) => w.length > 0);
+  return words.length > 0 ? words.map(titleizeColumnWord).join(" ") : column;
+}
+function humanizeSelectionTitle(columns) {
+  return columns.map(humanizeColumnLabel).join(" / ");
+}
 function normalizeColumnNames(value, tool, field) {
   if (!Array.isArray(value) || value.some((v) => typeof v !== "string" || v.trim() === "")) {
     throw new Error(
@@ -31131,10 +32386,52 @@ function normalizeColumnNames(value, tool, field) {
   }
   return value;
 }
+async function resolveSelectionDynamicRefs(deps, token, fields) {
+  const refs = /* @__PURE__ */ new Map();
+  for (const { label, value } of fields) {
+    if (value === void 0) continue;
+    const name = extractComponentReference(value, label);
+    if (name !== null) {
+      const labels = refs.get(name);
+      if (labels) labels.push(label);
+      else refs.set(name, [label]);
+    }
+  }
+  if (refs.size === 0) return;
+  const model = await deps.wizClient.get(path3(token, "model"));
+  const assemblies = model?.assemblies ?? [];
+  for (const [name, labels] of refs) {
+    requireResolvableComponentReference(
+      name,
+      labels.length === 1 ? labels[0] : labels.join(", "),
+      assemblies
+    );
+  }
+}
 function makeSetSelectionSourceTool(deps) {
   return {
     name: "set_selection_source",
-    description: "Point a selection list, selection tree, range slider (time slider) or calendar at the table/column its values come from.\n\nAn assembly added in the Composer starts with no source and renders empty until this is called. How many entries 'columns' takes depends on the assembly's type:\n\n  selection list / calendar   exactly one column\n  selection tree              one or more, in hierarchy order (top level first)\n  range slider                one column for a single range, two or more for a composite range\n\nCall list_bindable_fields for the table/column names this assembly can bind to; an unknown one is refused by name rather than left to render an empty assembly, and a wrong count for the assembly's type is refused naming what it actually needs.\n\n'measure' is a selection list's optional aggregate/bar-chart column \u2014 ignored for every other type.\n\nRepointing an assembly already bound to a different table is refused unless you pass force:true; rebinding within the same table (a different column, or a different set of hierarchy levels) does not need it.\n\nOne call is one undo checkpoint. Verify with get_viewsheet_image.",
+    description: `Point a selection list, selection tree, range slider (time slider) or calendar at the table/column its values come from.
+
+An assembly added in the Composer starts with no source and renders empty until this is called. How many entries 'columns' takes depends on the assembly's type:
+
+  selection list / calendar   exactly one column
+  selection tree              one or more, in hierarchy order (top level first)
+  range slider                one column for a single range, two or more for a composite range
+
+Call list_bindable_fields for the table/column names this assembly can bind to; an unknown one is refused by name rather than left to render an empty assembly, and a wrong count for the assembly's type is refused naming what it actually needs.
+
+'measure' is a selection list's optional aggregate/bar-chart column \u2014 ignored for every other type.
+
+A selection tree normally uses 'columns' (fixed hierarchy levels, top level first). For an arbitrary-depth tree from one flat, self-referencing table instead \u2014 an org chart, a category tree \u2014 pass 'parentIdColumn', 'idColumn' and 'labelColumn' together in place of 'columns': every row becomes one node, 'idColumn' is that node's own key, 'parentIdColumn' points at another row's 'idColumn' value (or is blank/unmatched for a root), and 'labelColumn' is what's displayed. All three are required together, and refused alongside 'columns' on the same call. These three are literal column names only \u2014 unlike 'measure', they do not accept "$(ComponentName)" (StyleBI's selection-tree query engine matches them by name against the resolved column list, not a live runtime value, so a dynamic id/parentId/label column would silently render an empty or broken tree rather than actually swap).
+
+'measure' also accepts "$(ComponentName)" \u2014 binds it to a CheckBox, ComboBox, RadioButton, Slider, Spinner, or TextInput assembly's live value instead of a literal column, so flipping that component swaps which measure is used. 'ComponentName' must name an existing assembly of one of those six types; a typo, a deleted assembly, or a reference to a non-input assembly is refused rather than saved and silently rendered wrong.
+
+Repointing an assembly already bound to a different table is refused unless you pass force:true; rebinding within the same table (a different column, or a different set of hierarchy levels) does not need it.
+
+**Also sets the assembly's display title** to a human-readable, properly-capitalized form of the bound column name(s) \u2014 e.g. \`STATE\` becomes "State", \`CATEGORY_NAME\` becomes "Category Name", and a multi-level tree/composite range joins each level's label with " / " (e.g. "Region / State") \u2014 the same title a fresh selection filter gets when a column is dropped onto it in the Composer, rather than the generic assembly name ("SelectionList1") it starts with. Call edit(op:"set_title") afterward to override it.
+
+One call is one undo checkpoint. Verify with get_viewsheet_image.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -31146,7 +32443,7 @@ function makeSetSelectionSourceTool(deps) {
         columns: {
           type: "array",
           items: { type: "string" },
-          description: "One or more column names, as reported by list_bindable_fields. How many are accepted depends on the assembly's type \u2014 see the tool description."
+          description: "One or more column names, as reported by list_bindable_fields. How many are accepted depends on the assembly's type \u2014 see the tool description. Omit for a selection tree bound instead via 'parentIdColumn'/'idColumn'/'labelColumn'."
         },
         additionalTables: {
           type: "array",
@@ -31155,14 +32452,26 @@ function makeSetSelectionSourceTool(deps) {
         },
         measure: {
           type: "string",
-          description: "Selection list only \u2014 an optional aggregate/bar-chart measure column."
+          description: 'Selection list only \u2014 an optional aggregate/bar-chart measure column. Also accepts "$(ComponentName)" \u2014 see the tool description.'
+        },
+        parentIdColumn: {
+          type: "string",
+          description: `Selection tree only, ID-hierarchy mode \u2014 the column holding each row's parent's 'idColumn' value. Required together with 'idColumn'/'labelColumn', in place of 'columns'. A literal column name only \u2014 does not accept "$(ComponentName)", see the tool description.`
+        },
+        idColumn: {
+          type: "string",
+          description: `Selection tree only, ID-hierarchy mode \u2014 the column holding each row's own unique key. Required together with 'parentIdColumn'/'labelColumn', in place of 'columns'. A literal column name only \u2014 does not accept "$(ComponentName)", see the tool description.`
+        },
+        labelColumn: {
+          type: "string",
+          description: `Selection tree only, ID-hierarchy mode \u2014 the column holding each row's displayed label. Required together with 'parentIdColumn'/'idColumn', in place of 'columns'. A literal column name only \u2014 does not accept "$(ComponentName)", see the tool description.`
         },
         force: {
           type: "boolean",
           description: "Discard an existing binding to a different table."
         }
       },
-      required: ["assembly", "table", "columns"]
+      required: ["assembly", "table"]
     },
     call: async (args) => {
       const assembly = requireAssembly10(args, "set_selection_source");
@@ -31172,34 +32481,74 @@ function makeSetSelectionSourceTool(deps) {
           "set_selection_source requires 'table' \u2014 the source table's name, as a string. list_bindable_fields reports what this assembly can bind to."
         );
       }
-      const columns = normalizeColumnNames(args.columns, "set_selection_source", "columns");
-      if (columns.length === 0) {
+      const idModeFields = [
+        ["parentIdColumn", args.parentIdColumn],
+        ["idColumn", args.idColumn],
+        ["labelColumn", args.labelColumn]
+      ];
+      const idModeGiven = idModeFields.filter(([, v]) => v !== void 0 && v.trim() !== "");
+      if (idModeGiven.length > 0 && idModeGiven.length < idModeFields.length) {
         throw new Error(
-          "set_selection_source requires 'columns' \u2014 at least one column name, as reported by list_bindable_fields."
+          "set_selection_source's 'parentIdColumn', 'idColumn' and 'labelColumn' are required together \u2014 got " + idModeGiven.map(([k]) => `'${k}'`).join(", ") + " but not " + idModeFields.filter(([, v]) => v === void 0 || v.trim() === "").map(([k]) => `'${k}'`).join(", ") + "."
+        );
+      }
+      const idMode = idModeGiven.length === idModeFields.length;
+      const hasColumns = Array.isArray(args.columns) && args.columns.length > 0;
+      if (idMode && hasColumns) {
+        throw new Error(
+          "set_selection_source's 'columns' cannot be combined with 'parentIdColumn'/'idColumn'/'labelColumn' \u2014 pick one hierarchy shape per call."
+        );
+      }
+      if (idMode) {
+        for (const [key, value] of idModeFields) {
+          if (extractComponentReference(value, `'${key}'`) !== null) {
+            throw new Error(
+              `set_selection_source's '${key}' does not accept a "$(ComponentName)" dynamic reference: StyleBI's selection-tree query engine matches ID-hierarchy columns by name against the resolved column list, not a live runtime value, so this would silently render an empty or broken tree. Use a literal column name, as reported by list_bindable_fields.`
+            );
+          }
+        }
+      }
+      const columns = idMode ? [] : normalizeColumnNames(args.columns, "set_selection_source", "columns");
+      if (!idMode && columns.length === 0) {
+        throw new Error(
+          "set_selection_source requires 'columns' \u2014 at least one column name, as reported by list_bindable_fields \u2014 or 'parentIdColumn'/'idColumn'/'labelColumn' for a selection tree's ID-hierarchy mode."
         );
       }
       const additionalTables = args.additionalTables === void 0 ? void 0 : normalizeColumnNames(args.additionalTables, "set_selection_source", "additionalTables");
       const force = normalizeForce(args.force, "set_selection_source");
       const token = await requireSession2(deps);
+      await resolveSelectionDynamicRefs(deps, token, [
+        { label: "'measure'", value: args.measure }
+      ]);
       const result = await deps.wizClient.post(path4(token, "selection/source"), {
         assembly,
         table,
         columns,
         additionalTables,
         measure: args.measure,
+        parentIdColumn: args.parentIdColumn,
+        idColumn: args.idColumn,
+        labelColumn: args.labelColumn,
         force
       });
       const boundTable = result?.table ?? table;
-      const boundColumns = result?.columns ?? columns;
-      const shape = result?.composite !== void 0 ? result.composite ? " (composite range)" : " (single range)" : result?.levels !== void 0 ? ` (${result.levels} hierarchy level(s))` : "";
+      const boundColumns = idMode ? [args.idColumn, args.parentIdColumn, args.labelColumn].filter((v) => typeof v === "string") : result?.columns ?? columns;
+      const title = idMode ? humanizeSelectionTitle([args.labelColumn ?? args.idColumn]) : humanizeSelectionTitle(boundColumns);
+      const shape = result?.composite !== void 0 ? result.composite ? " (composite range)" : " (single range)" : result?.levels !== void 0 ? ` (${result.levels} hierarchy level(s))` : idMode ? " (ID-hierarchy mode)" : "";
+      await deps.wizClient.post(path3(token, "edit"), {
+        op: "set_title",
+        assembly,
+        title
+      });
       return {
         ok: true,
         assembly,
         table: boundTable,
         columns: boundColumns,
+        title,
         ...result?.composite !== void 0 ? { composite: result.composite } : {},
         ...result?.levels !== void 0 ? { levels: result.levels } : {},
-        summary: `Bound ${assembly} to ${boundTable} (${boundColumns.join(", ")})${shape}.` + (force ? " Any binding to a different table was discarded." : "") + " Verify with get_viewsheet_image."
+        summary: idMode ? `Bound ${assembly} to ${boundTable} in ID-hierarchy mode (parentIdColumn: ${args.parentIdColumn}, idColumn: ${args.idColumn}, labelColumn: ${args.labelColumn})${shape}, titled "${title}".` + (force ? " Any binding to a different table was discarded." : "") + " Verify with get_viewsheet_image." : `Bound ${assembly} to ${boundTable} (${boundColumns.join(", ")})${shape}, titled "${title}".` + (force ? " Any binding to a different table was discarded." : "") + " Verify with get_viewsheet_image."
       };
     }
   };
@@ -31390,10 +32739,37 @@ function makeClearCalendarTool(deps) {
     }
   };
 }
+function checkTextInputBounds(assembly, rawModel, value) {
+  const pane = rawModel?.textInputColumnOptionPaneModel;
+  if (pane?.type !== "Float" && pane?.type !== "Integer") {
+    return;
+  }
+  const editor = pane.type === "Float" ? pane.floatEditorModel : pane.integerEditorModel;
+  const minimum = editor?.minimum;
+  const maximum = editor?.maximum;
+  const num = typeof value === "number" ? value : Number(value);
+  const parseable = (typeof value === "number" || typeof value === "string") && String(value).trim() !== "" && !Number.isNaN(num);
+  if (!parseable) {
+    throw new Error(
+      `set_input_value: value ${JSON.stringify(value)} is not a number, but ${assembly}'s Input Editor requires ${pane.type}.`
+    );
+  }
+  if (pane.type === "Integer" && !Number.isInteger(num)) {
+    throw new Error(
+      `set_input_value: value ${JSON.stringify(value)} is not a whole number, but ${assembly}'s Input Editor requires Integer.`
+    );
+  }
+  if (minimum != null && num < minimum || maximum != null && num > maximum) {
+    const bound = minimum != null && maximum != null ? `between ${minimum} and ${maximum}` : minimum != null ? `at least ${minimum}` : `at most ${maximum}`;
+    throw new Error(
+      `set_input_value: value ${num} is outside ${assembly}'s configured Input Editor bound \u2014 must be ${bound}.`
+    );
+  }
+}
 function makeSetInputValueTool(deps) {
   return {
     name: "set_input_value",
-    description: 'Set an input assembly\'s value \u2014 combo box, check box, radio button, text input or spinner.\n\n  {assembly: "Year",   value: ["2026"]}          a combo box, radio button or text input\n  {assembly: "Regions", value: ["East","West"]}   a check box, which holds several\n  {assembly: "Year",   value: []}                 clears it\n\n**Only a check box accepts more than one value**; several on anything else is refused rather than truncated.\n\n**`value` is required, and `[]` is how you clear it.** Omitting it is refused, so that clearing an input is always something you asked for rather than a default.\n\nA submit button is **not** an input assembly \u2014 it is an output assembly and holds no value, so it is refused.\n\nThe value is written into the asset on save, so it becomes what every future viewer opens with. Since an input drives what dependent assemblies show, and the dashboard gives no sign that its value was set by anything other than a person, the response carries a disclosure.',
+    description: 'Set an input assembly\'s value \u2014 combo box, check box, radio button, text input or spinner.\n\n  {assembly: "Year",   value: ["2026"]}          a combo box, radio button or text input\n  {assembly: "Regions", value: ["East","West"]}   a check box, which holds several\n  {assembly: "Year",   value: []}                 clears it\n\n**Only a check box accepts more than one value**; several on anything else is refused rather than truncated.\n\n**`value` is required, and `[]` is how you clear it.** Omitting it is refused, so that clearing an input is always something you asked for rather than a default.\n\nA submit button is **not** an input assembly \u2014 it is an output assembly and holds no value, so it is refused.\n\nFor a single-value write, a TextInput configured with a Float or Integer Input Editor is checked against its configured minimum/maximum before the write, and refused with the bound named if it is out of range or not a number. This is a best-effort client-side check, not a guarantee \u2014 the server itself does not enforce this bound for any caller.\n\nThe value is written into the asset on save, so it becomes what every future viewer opens with. Since an input drives what dependent assemblies show, and the dashboard gives no sign that its value was set by anything other than a person, the response carries a disclosure.',
     inputSchema: {
       type: "object",
       properties: {
@@ -31415,6 +32791,12 @@ function makeSetInputValueTool(deps) {
       }
       const values = args.value;
       const token = await requireSession(deps);
+      if (values.length === 1) {
+        const rawModel = await deps.wizClient.get(
+          path3(token, `properties?assembly=${encodeURIComponent(assembly)}&raw=true`)
+        );
+        checkTextInputBounds(assembly, rawModel, values[0]);
+      }
       const result = await deps.wizClient.post(path3(token, "input/value"), {
         assembly,
         value: values
@@ -31441,6 +32823,376 @@ function makeCalendarInputTools(deps) {
     makeClearCalendarTool(deps),
     makeSetInputValueTool(deps)
   ];
+}
+
+// src/tools/formTableTools.ts
+var NOT_A_FORM_TABLE_NOTE = " Refused if `assembly` is not a Table with Form enabled in Table > Form Options -- the same restriction the Preview toolbar's own Insert Row / Delete Row / cell edit / Apply enforce.";
+function summarizeSnapshot(snapshot) {
+  if (snapshot?.rowCount == null) {
+    return "";
+  }
+  return ` The table now reports ${snapshot.rowCount} data row(s).`;
+}
+function makeFormTableInsertRowTool(deps) {
+  return {
+    name: "form_table_insert_row",
+    description: 'Insert a blank row into a Form-enabled Table assembly at runtime -- the same action the Preview toolbar\'s Insert Row button performs, via the same underlying mechanism (not a design-time worksheet edit; see insert_row/delete_row in worksheetTools for that).\n\n**This only mutates the in-memory form state.** The new row is blank and does not reach the underlying data source until form_table_apply is called -- use form_table_set_cell to fill it in first if the column requires a non-blank value.\n\n`mode: "insert"` (the default) inserts the new row AT `index`, shifting `index` and everything after it down one. `mode: "append"` inserts the new row AFTER `index` instead.\n\nRefused if `assembly` does not have Insert enabled in Table > Form Options -- the native service does not check this itself, so a caller bypassing the toolbar could otherwise do what a hidden Insert button would have.' + NOT_A_FORM_TABLE_NOTE,
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The Form Table assembly's name." },
+        index: { type: "number", description: "0-based data row index to insert at/after." },
+        mode: {
+          type: "string",
+          enum: ["insert", "append"],
+          description: '"insert" (default) inserts at index; "append" inserts after index.'
+        }
+      },
+      required: ["assembly", "index"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly(args, "form_table_insert_row");
+      if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
+        throw new Error(
+          "form_table_insert_row requires 'index' as a non-negative integer 0-based data row index."
+        );
+      }
+      const token = await requireSession(deps);
+      const result = await deps.wizClient.post(path3(token, "form-table/insert-row"), {
+        assembly,
+        index: args.index,
+        mode: args.mode === "append" ? "append" : "insert"
+      });
+      return {
+        ok: true,
+        assembly,
+        rowCount: result?.rowCount ?? null,
+        rows: result?.rows ?? [],
+        summary: `Inserted a blank row into ${assembly}.${summarizeSnapshot(result)} Not yet written back -- call form_table_apply to commit.`
+      };
+    }
+  };
+}
+function makeFormTableDeleteRowTool(deps) {
+  return {
+    name: "form_table_delete_row",
+    description: "Delete one or more rows from a Form-enabled Table assembly at runtime -- the same action the Preview toolbar's Delete Row button performs.\n\n**This only mutates the in-memory form state.** The deletion does not reach the underlying data source until form_table_apply is called.\n\n`rows` is 0-based data row indices; several can be deleted in one call.\n\nRefused if `assembly` does not have Delete enabled in Table > Form Options -- the native service does not check this itself, so a caller bypassing the toolbar could otherwise do what a hidden Delete button would have." + NOT_A_FORM_TABLE_NOTE,
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The Form Table assembly's name." },
+        rows: {
+          type: "array",
+          items: { type: "number" },
+          description: "0-based data row indices to delete."
+        }
+      },
+      required: ["assembly", "rows"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly(args, "form_table_delete_row");
+      if (!Array.isArray(args.rows) || args.rows.length === 0 || !args.rows.every((r) => typeof r === "number" && Number.isInteger(r) && r >= 0)) {
+        throw new Error(
+          "form_table_delete_row requires 'rows' as a non-empty array of non-negative integer 0-based data row indices."
+        );
+      }
+      const token = await requireSession(deps);
+      const result = await deps.wizClient.post(path3(token, "form-table/delete-rows"), {
+        assembly,
+        rows: args.rows
+      });
+      return {
+        ok: true,
+        assembly,
+        rowCount: result?.rowCount ?? null,
+        rows: result?.rows ?? [],
+        summary: `Deleted ${args.rows.length} row(s) from ${assembly}.${summarizeSnapshot(result)} Not yet written back -- call form_table_apply to commit.`
+      };
+    }
+  };
+}
+function makeFormTableSetCellTool(deps) {
+  return {
+    name: "form_table_set_cell",
+    description: "Set one cell's value in a Form-enabled Table assembly at runtime -- typically used to fill in a row just added with form_table_insert_row, since a fresh row starts blank.\n\n`row`/`col` are 0-based data-row/visible-column indices in the same space form_table_insert_row's/form_table_apply's returned `rows` uses.\n\n**This only mutates the in-memory form state.** The value does not reach the underlying data source until form_table_apply is called, which also validates it against the column's configured type/options and refuses the write if invalid.\n\nUnlike insert/delete, this does not require Insert or Delete to be enabled -- only that `assembly` is a Form table." + NOT_A_FORM_TABLE_NOTE,
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The Form Table assembly's name." },
+        row: { type: "number", description: "0-based data row index." },
+        col: { type: "number", description: "0-based visible column index." },
+        value: { type: "string", description: "New cell value as text (null/omitted clears it)." }
+      },
+      required: ["assembly", "row", "col"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly(args, "form_table_set_cell");
+      if (typeof args.row !== "number" || !Number.isInteger(args.row) || args.row < 0) {
+        throw new Error("form_table_set_cell requires 'row' as a non-negative integer.");
+      }
+      if (typeof args.col !== "number" || !Number.isInteger(args.col) || args.col < 0) {
+        throw new Error("form_table_set_cell requires 'col' as a non-negative integer.");
+      }
+      const token = await requireSession(deps);
+      const result = await deps.wizClient.post(path3(token, "form-table/set-cell"), {
+        assembly,
+        row: args.row,
+        col: args.col,
+        value: args.value ?? null
+      });
+      return {
+        ok: true,
+        assembly,
+        row: args.row,
+        col: args.col,
+        rowCount: result?.rowCount ?? null,
+        rows: result?.rows ?? [],
+        summary: `Set ${assembly}[${args.row}][${args.col}] = ${JSON.stringify(args.value ?? null)}. Not yet written back -- call form_table_apply to commit.`
+      };
+    }
+  };
+}
+function makeFormTableApplyTool(deps) {
+  return {
+    name: "form_table_apply",
+    description: "Commit a Form-enabled Table's pending insert/delete/cell-edits -- the same action the Preview toolbar's Apply (checkmark) button performs. This is the only one of the four form_table_* tools that actually writes through the Form binding into the worksheet's embedded table and saves it; form_table_insert_row/delete_row/set_cell only change in-memory state.\n\nA Form Table can only ever write back to a worksheet EMBEDDED table -- never a live JOIN/MIRROR/query-backed table. That mismatch, and any other native validation failure (e.g. a blank required cell), is refused here with the server's own named error rather than a generic failure.\n\nRefused if `assembly` does not have write-back enabled in Table > Form Options -- the native write-back silently does nothing for this case rather than throwing, so it is refused here instead with a named reason." + NOT_A_FORM_TABLE_NOTE,
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The Form Table assembly's name." }
+      },
+      required: ["assembly"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly(args, "form_table_apply");
+      const token = await requireSession(deps);
+      const result = await deps.wizClient.post(path3(token, "form-table/apply"), {
+        assembly
+      });
+      return {
+        ok: true,
+        assembly,
+        rowCount: result?.rowCount ?? null,
+        rows: result?.rows ?? [],
+        summary: `Committed ${assembly}'s pending row edits to its underlying embedded table and saved.${summarizeSnapshot(result)}`,
+        // The rendered table already showed these rows/values before this call (FormTableLens
+        // renders pending edits immediately) -- nothing on screen distinguishes "still pending"
+        // from "written back to the worksheet table and saved".
+        disclosure: disclosure(
+          assembly,
+          "meaning",
+          `${assembly}'s pending row edits are now committed to its underlying worksheet embedded table and saved with the sheet. The dashboard looked the same before and after this call, so nothing on screen indicates whether the edits were ever actually persisted.`
+        )
+      };
+    }
+  };
+}
+function makeFormTableTools(deps) {
+  return [
+    makeFormTableInsertRowTool(deps),
+    makeFormTableDeleteRowTool(deps),
+    makeFormTableSetCellTool(deps),
+    makeFormTableApplyTool(deps)
+  ];
+}
+
+// src/tools/columnOptionTools.ts
+var INPUT_CONTROLS = ["Text", "ComboBox", "Date", "Integer", "Float", "Boolean"];
+function normalizeInputControl(value, tool) {
+  if (typeof value === "string") {
+    const match = INPUT_CONTROLS.find((c) => c.toLowerCase() === value.trim().toLowerCase());
+    if (match) return match;
+  }
+  throw new Error(
+    `${tool}: 'inputControl' must be one of ${INPUT_CONTROLS.join(", ")} -- got ${JSON.stringify(value)}.`
+  );
+}
+function requireCol(args, tool) {
+  const col = args.col;
+  if (typeof col === "number" && Number.isInteger(col) && col >= 0) return col;
+  if (typeof col === "string" && col.trim() !== "") return col;
+  throw new Error(`${tool} requires 'col' -- a column name or 0-based visible column index.`);
+}
+function makeGetColumnOptionsTool(deps) {
+  return {
+    name: "get_column_options",
+    description: "Read a Table column's Column Options -- the input editor type, validation rule, and error message the Composer's own column-header right-click 'Column Options' dialog sets (input control, min/max/pattern bounds, the message shown on a bad entry).\n\n`col` is either the column's name or a 0-based visible-column index -- resolved server-side against this table's own visible-column list, not the possibly-different order get_table_binding reports (which includes hidden columns).\n\nAn un-configured column reports enableColumnEditing:false and editor:null.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The Table assembly's name." },
+        col: {
+          description: "The column, by name or 0-based visible index.",
+          oneOf: [{ type: "string" }, { type: "number" }]
+        },
+        raw: {
+          type: "boolean",
+          description: "Also include comboBoxBlankEditor, a read-only scaffold for building a fresh ComboBox editor -- omitted by default as noise for every other inputControl."
+        }
+      },
+      required: ["assembly", "col"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly(args, "get_column_options");
+      const col = requireCol(args, "get_column_options");
+      const token = await requireSession(deps);
+      const model = await deps.wizClient.get(
+        path3(token, `column-options?assembly=${encodeURIComponent(assembly)}&col=${encodeURIComponent(String(col))}`)
+      );
+      return {
+        assembly,
+        col,
+        enableColumnEditing: model?.enableColumnEditing ?? false,
+        inputControl: model?.inputControl ?? null,
+        editor: model?.editor ?? null,
+        ...args.raw === true ? { comboBoxBlankEditor: model?.comboBoxBlankEditor ?? null } : {}
+      };
+    }
+  };
+}
+function makeSetColumnOptionsTool(deps) {
+  return {
+    name: "set_column_options",
+    description: "Set a Table column's Column Options -- the same input control, validation bound and error message the Composer's own column-header right-click 'Column Options' dialog sets.\n\n`col` is either the column's name or a 0-based visible-column index -- resolved server-side against this table's own visible-column list, not the possibly-different order get_table_binding reports (which includes hidden columns).\n\n`inputControl` is required whenever `enableColumnEditing` is true, and must be exactly one of Text, ComboBox, Date, Integer, Float, Boolean -- another spelling (e.g. CheckBox, Spinner) is refused by name rather than silently dropped by the backend.\n\n`editor` carries the validation bound and error message, shaped by `inputControl`:\n  Text:     {pattern?, errorMessage?}\n  Date:     {minimum?, maximum?, errorMessage?}   (minimum/maximum as date strings)\n  Integer:  {minimum?, maximum?, errorMessage?}\n  Float:    {minimum?, maximum?, errorMessage?}\n  ComboBox: {embedded?, query?, dataType?, selectionListDialogModel?, variableListDialogModel?}\n  Boolean:  no editor -- omit it (a Boolean column renders as a checkbox with nothing further to configure); passing one anyway is refused.\n\n**`enableColumnEditing:false` resets the column to a blank default Text editor** -- the same server-side behavior the Composer's own dialog has, discarding whatever editor was previously configured. `inputControl`/`editor` are not needed in that case.\n\nOne call is one undo checkpoint. Verify with get_column_options or get_viewsheet_image.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        assembly: { type: "string", description: "The Table assembly's name." },
+        col: {
+          description: "The column, by name or 0-based visible index.",
+          oneOf: [{ type: "string" }, { type: "number" }]
+        },
+        enableColumnEditing: {
+          type: "boolean",
+          description: "false resets the column to a blank default Text editor."
+        },
+        inputControl: {
+          type: "string",
+          description: "Text | ComboBox | Date | Integer | Float | Boolean. Required when enableColumnEditing is true."
+        },
+        editor: {
+          type: "object",
+          description: "Shape depends on inputControl -- see this tool's own description."
+        }
+      },
+      required: ["assembly", "col", "enableColumnEditing"]
+    },
+    call: async (args) => {
+      const assembly = requireAssembly(args, "set_column_options");
+      const col = requireCol(args, "set_column_options");
+      if (typeof args.enableColumnEditing !== "boolean") {
+        throw new Error("set_column_options requires 'enableColumnEditing' as a boolean.");
+      }
+      const body = { assembly, col, enableColumnEditing: args.enableColumnEditing };
+      let inputControl;
+      if (args.enableColumnEditing) {
+        inputControl = normalizeInputControl(args.inputControl, "set_column_options");
+        body.inputControl = inputControl;
+        if (inputControl === "Boolean") {
+          if (args.editor !== void 0 && args.editor !== null) {
+            throw new Error(
+              `set_column_options: 'editor' must be omitted for inputControl:"Boolean" -- a Boolean column has no editor sub-object.`
+            );
+          }
+        } else {
+          if (args.editor === null || typeof args.editor !== "object" || Array.isArray(args.editor)) {
+            throw new Error(
+              `set_column_options requires 'editor' as an object when inputControl is "${inputControl}".`
+            );
+          }
+          body.editor = { ...args.editor, type: inputControl };
+        }
+      }
+      const token = await requireSession(deps);
+      await deps.wizClient.post(path3(token, "column-options"), body);
+      return {
+        ok: true,
+        assembly,
+        col,
+        summary: args.enableColumnEditing ? `Set ${assembly}'s column ${col} to a ${inputControl} editor.` : `Disabled column editing on ${assembly}'s column ${col} -- reset to a blank default Text editor, discarding any previously configured editor.`
+      };
+    }
+  };
+}
+function makeColumnOptionTools(deps) {
+  return [makeGetColumnOptionsTool(deps), makeSetColumnOptionsTool(deps)];
+}
+
+// src/tools/parameterTools.ts
+function makeCollectParametersTool(deps) {
+  return {
+    name: "collect_parameters",
+    description: "List the variables (parameters) the connected viewsheet's own source query and viewsheet tree reference \u2014 the same set StyleBI's own 'Parameters' prompt dialog would show. Use this to discover a variable that has no on-canvas input assembly (e.g. one only referenced in the base worksheet's own filter/expression), then set it with set_parameters.\n\n**Excludes** any variable already bound to an on-canvas input assembly (RadioButton, ComboBox, CheckBox, TextInput, Spinner) \u2014 use set_input_value for those instead; setting the same variable through both mechanisms would fight over its value.\n\nEach entry reports `name`, `label`, `type`, `multipleSelection` (true only for a variable that accepts several values at once), `choices` (an enumerated picker's values, or null for free-form), and `currentValue` (null if never set in this session).",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    call: async () => {
+      const token = await requireSession(deps);
+      const parameters = await deps.wizClient.get(path3(token, "parameters"));
+      return {
+        parameters,
+        summary: parameters.length === 0 ? "This viewsheet has no parameters to collect." : `${parameters.length} parameter(s): ${parameters.map((p) => p.name).join(", ")}.`
+      };
+    }
+  };
+}
+function normalizeParameterValues(values) {
+  if (typeof values !== "object" || values === null || Array.isArray(values)) {
+    throw new Error(
+      `set_parameters requires 'values' as an object mapping parameter name to its new value, e.g. {stateVar: "AZ"}.`
+    );
+  }
+  const entries = Object.entries(values);
+  if (entries.length === 0) {
+    throw new Error(
+      "set_parameters requires 'values' to name at least one parameter \u2014 collect_parameters lists what is settable."
+    );
+  }
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const [name, value] of entries) {
+    out[name] = Array.isArray(value) ? value : [value];
+  }
+  return out;
+}
+function makeSetParametersTool(deps) {
+  return {
+    name: "set_parameters",
+    description: `Set one or more viewsheet parameter values discovered via collect_parameters, and refresh the viewsheet \u2014 the same effect as answering StyleBI's own 'Parameters' prompt dialog and clicking OK.
+
+  {values: {"stateVar": "AZ"}}                     a single-value parameter
+  {values: {"regions": ["East", "West"]}}          a multi-value parameter
+
+A name collect_parameters does not list is refused by name \u2014 it is either not referenced anywhere in this viewsheet's source/tree, or it is already bound to an on-canvas input assembly (use set_input_value for that one instead).
+
+The value is written into the live session and, on save, becomes what every future viewer opens with. Since a parameter drives what the underlying query returns, and the dashboard gives no sign a value was set by a tool rather than a person, the response carries a disclosure.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        values: {
+          type: "object",
+          description: "Map of parameter name to its new value \u2014 a scalar for a single-value parameter, an array for a multi-value one."
+        }
+      },
+      required: ["values"]
+    },
+    call: async (args) => {
+      const values = normalizeParameterValues(args.values);
+      const token = await requireSession(deps);
+      const result = await deps.wizClient.post(path3(token, "parameters"), { values });
+      const applied = result?.applied ?? Object.keys(values);
+      return {
+        ok: true,
+        applied,
+        summary: `Set ${applied.length} parameter(s): ${applied.join(", ")}.`,
+        disclosure: disclosure(
+          applied.join(", "),
+          "meaning",
+          `${applied.join(", ")} now hold new value(s), and anything the underlying query/tree derives from them reflects that. The dashboard gives no sign the value was set by a tool rather than a person, and it is saved with the sheet.`
+        )
+      };
+    }
+  };
+}
+function makeParameterTools(deps) {
+  return [makeCollectParametersTool(deps), makeSetParametersTool(deps)];
 }
 
 // src/tools/undoTools.ts
@@ -32160,29 +33912,42 @@ function makeReadTableStyleTool(deps) {
 function makeUpdateTableStyleTool(deps) {
   return {
     name: "update_table_style",
-    description: "Modify an existing Table Style's formatting. 'format' is merged region-by-region onto the style's current formatting -- a region you supply (e.g. 'body') replaces that whole region; a region you omit is left exactly as it was. Get 'styleId' from list_table_styles first. Session-independent -- no connect_sheet required.",
+    description: "Modify an existing Table Style: rename it, move it to a different folder, and/or change its formatting. 'name'/'folder' change the style's identity (rename/move, or both at once); omit either to leave it as-is. 'format' is merged region-by-region onto the style's current formatting -- a region you supply (e.g. 'body') replaces that whole region; a region you omit is left exactly as it was. At least one of 'name', 'folder', 'format' is required. Get 'styleId' from list_table_styles first. Refuses if the resolved new name already exists in the target folder. Session-independent -- no connect_sheet required.",
     inputSchema: {
       type: "object",
       properties: {
         styleId: { type: "string", description: "Style ID, from list_table_styles' 'styleId' field." },
+        name: { type: "string", description: "New display name (rename), e.g. 'BorderedBands'. Omit to keep the current name." },
+        folder: { type: "string", description: "New library folder, e.g. 'User Defined' (move). Omit to keep the current folder; pass '' for the library root." },
         format: { type: "object", description: "TableStyleFormat overrides -- see read_table_style's output shape for the full field list." }
       },
-      required: ["styleId", "format"]
+      required: ["styleId"]
     },
     call: async (args) => {
       if (!args.styleId || !args.styleId.trim()) {
         throw new Error("update_table_style: 'styleId' is required. Call list_table_styles first.");
       }
-      if (!args.format || typeof args.format !== "object") {
-        throw new Error("update_table_style: 'format' is required. Call read_table_style first to see the current formatting, then pass the regions to change.");
+      if (args.name === void 0 && args.folder === void 0 && args.format === void 0) {
+        throw new Error("update_table_style: provide at least one of 'name', 'folder', or 'format' to change.");
       }
-      const current = await deps.wizClient.get(
-        `${BASE_PATH2}/${encodeURIComponent(args.styleId)}`
-      );
-      const merged = mergeFormat(fromWireFormat(current.format), args.format);
-      await deps.wizClient.put(`${BASE_PATH2}/${encodeURIComponent(args.styleId)}`, {
-        format: toWireFormat(merged)
-      });
+      if (args.format !== void 0 && typeof args.format !== "object") {
+        throw new Error("update_table_style: 'format' must be an object. Call read_table_style first to see the current formatting, then pass the regions to change.");
+      }
+      const body = {};
+      if (args.name !== void 0) {
+        body.name = args.name;
+      }
+      if (args.folder !== void 0) {
+        body.folder = args.folder;
+      }
+      if (args.format !== void 0) {
+        const current = await deps.wizClient.get(
+          `${BASE_PATH2}/${encodeURIComponent(args.styleId)}`
+        );
+        const merged = mergeFormat(fromWireFormat(current.format), args.format);
+        body.format = toWireFormat(merged);
+      }
+      await deps.wizClient.put(`${BASE_PATH2}/${encodeURIComponent(args.styleId)}`, body);
       return { ok: true };
     }
   };
@@ -32270,6 +34035,7 @@ function createServer(overrides = {}) {
     makeSearchProductDocsTool({ wizClient, preflight: () => assertDocsSearchRouting(tokenStore) }),
     ...makeViewsheetTools(domainDeps),
     ...makePropertyTools(domainDeps),
+    ...makeHierarchyDimensionTools(domainDeps),
     ...makeSheetPropertyTools(domainDeps),
     ...makeOpenTools(domainDeps),
     ...makeHyperlinkTools(domainDeps),
@@ -32288,6 +34054,9 @@ function createServer(overrides = {}) {
     ...makeConvertTools(domainDeps),
     ...makeSelectionTools(domainDeps),
     ...makeCalendarInputTools(domainDeps),
+    ...makeFormTableTools(domainDeps),
+    ...makeColumnOptionTools(domainDeps),
+    ...makeParameterTools(domainDeps),
     ...makeUndoTools(domainDeps),
     ...makeWorksheetTools(domainDeps),
     ...makeLayoutTools(domainDeps),
